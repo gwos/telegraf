@@ -91,11 +91,8 @@ func RunClassifyTest(t *testing.T, cl *Classify, metrics []telegraf.Metric, wait
 	if len(waitTime) > 0 {
 		time.Sleep(waitTime[0])
 	}
-	err = cl.Stop()
-	if err != nil {
-		err = fmt.Errorf("the classify plugin could not be stopped:\n%v", err)
-		return acc, err
-	}
+	cl.Stop()
+
 	return acc, err
 }
 
@@ -180,8 +177,7 @@ func TestParseSelectorItem(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.NoError(t, err, "subtest:  no selector tag or selector field")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 
 	// Only selector tag.
 	cl.SelectorTag = "host_tag"
@@ -189,8 +185,7 @@ func TestParseSelectorItem(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.NoError(t, err, "subtest:  only selector tag")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 
 	// Both selector tag and selector field.
 	cl.SelectorField = "host_field"
@@ -198,8 +193,7 @@ func TestParseSelectorItem(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.Error(t, err, "subtest:  both selector tag and selector field")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 
 	// Only selector field.
 	cl.SelectorTag = ""
@@ -207,8 +201,7 @@ func TestParseSelectorItem(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.NoError(t, err, "subtest:  only selector field")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 }
 
 // Make sure that all variants of specifying a match item work as desired.
@@ -239,8 +232,7 @@ func TestParseMatchItem(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.Error(t, err, "subtest:  no match tag or match field")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 
 	// Only match tag.
 	cl.MatchTag = "message_tag"
@@ -248,8 +240,7 @@ func TestParseMatchItem(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.NoError(t, err, "subtest:  only match tag")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 
 	// Both match tag and match field.
 	cl.MatchField = "message_field"
@@ -257,8 +248,7 @@ func TestParseMatchItem(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.Error(t, err, "subtest:  both match tag and match field")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 
 	// Only match field.
 	cl.MatchTag = ""
@@ -266,8 +256,7 @@ func TestParseMatchItem(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.NoError(t, err, "subtest:  only match field")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 }
 
 // Make sure that all variants of specifying a result item work as desired.
@@ -298,8 +287,7 @@ func TestParseResultItem(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.Error(t, err, "subtest:  no result tag or result field")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 
 	// Only result tag.
 	cl.ResultTag = "severity_tag"
@@ -307,8 +295,7 @@ func TestParseResultItem(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.NoError(t, err, "subtest:  only result tag")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 
 	// Both result tag and result field.
 	cl.ResultField = "severity_field"
@@ -316,8 +303,7 @@ func TestParseResultItem(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.Error(t, err, "subtest:  both result tag and result field")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 
 	// Only result field.
 	cl.ResultTag = ""
@@ -325,8 +311,7 @@ func TestParseResultItem(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.NoError(t, err, "subtest:  only result field")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 }
 
 // Test the ability of the plugin to output a sample configuration file.
@@ -617,8 +602,7 @@ func TestBadSelectorRegex(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.NoError(t, err, "subtest:  good selector mapping regex")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 
 	// Test the behavior if a selector_mapping pattern won't compile as a regex.
 	cl.SelectorMapping = []map[string]string{{`*pg\d{3}`: "database"}}
@@ -626,8 +610,7 @@ func TestBadSelectorRegex(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.Error(t, err, "subtest:  bad selector_mapping regex [bad repetition]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 
 	// Test the behavior if an empty selector_mapping pattern is specified.
 	cl.SelectorMapping = []map[string]string{{``: "database"}}
@@ -635,8 +618,7 @@ func TestBadSelectorRegex(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.Error(t, err, "subtest:  bad selector_mapping regex [empty regex]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 }
 
 // Test the error handling if a category regex is not specified as either a
@@ -664,8 +646,7 @@ func TestBadCategoryRegexType(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.NoError(t, err, "subtest:  good category regex type [single-string]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 
 	// Multi-line string.
 	// Here we simulate what we will get back from a TOML Multi-line literal
@@ -680,8 +661,7 @@ func TestBadCategoryRegexType(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.NoError(t, err, "subtest:  good category regex type [multi-line string]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 
 	// Multi-line string, containing some invisible whitespace immediately
 	// after the opening delimiter in a multi-line literal string, before
@@ -693,8 +673,7 @@ func TestBadCategoryRegexType(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.NoError(t, err, "subtest:  good category regex type [multi-line string with invisible leading whitespace]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 
 	// Multi-line string, containing just the whitespace at the beginning of a line.
 	// This would be the case if the user used the form of a multi-line literal
@@ -708,8 +687,7 @@ func TestBadCategoryRegexType(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.NoError(t, err, "subtest:  good category regex type [multi-line string containing no regexes]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 
 	// Array of strings.
 	cl.MappedSelectorRegexes["test-group"] = []map[string]interface{}{
@@ -719,8 +697,7 @@ func TestBadCategoryRegexType(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.NoError(t, err, "subtest:  good category regex type [array-of-strings]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 
 	cl.MappedSelectorRegexes["test-group"] = []map[string]interface{}{
 		{"ignore": nil},
@@ -729,8 +706,7 @@ func TestBadCategoryRegexType(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.Error(t, err, "subtest:  bad category regex type [nil-value]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 
 	myString := "IGNORE"
 	cl.MappedSelectorRegexes["test-group"] = []map[string]interface{}{
@@ -740,8 +716,7 @@ func TestBadCategoryRegexType(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.Error(t, err, "subtest:  bad category regex type [ptr-to-string]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 
 	cl.MappedSelectorRegexes["test-group"] = []map[string]interface{}{
 		{"ignore": 42},
@@ -750,8 +725,7 @@ func TestBadCategoryRegexType(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.Error(t, err, "subtest:  bad category regex type [integer]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 }
 
 // Test what happens if the user supplies an invalid category regex.
@@ -779,8 +753,7 @@ func TestBadCategoryRegex(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.Error(t, err, "subtest:  duplicate category for the same mapped_selector_regexes group [bad repetition]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 
 	// Test the behavior if a mapped_selector_regexes regex won't compile as a regex.
 	cl.MappedSelectorRegexes["test-group"] = []map[string]interface{}{
@@ -790,8 +763,7 @@ func TestBadCategoryRegex(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.Error(t, err, "subtest:  bad mapped_selector_regexes regex [bad repetition]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 
 	// Test the behavior if an empty mapped_selector_regexes regex is specified.
 	cl.MappedSelectorRegexes["test-group"] = []map[string]interface{}{
@@ -801,8 +773,7 @@ func TestBadCategoryRegex(t *testing.T) {
 	require.NoError(t, err, "the Classify object could not be reset")
 	err = cl.Start(acc)
 	require.Error(t, err, "subtest:  bad mapped_selector_regexes regex [empty regex]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 }
 
 // Test whatever it is we want to do with the default_category option.
@@ -1056,8 +1027,7 @@ func TestAggregationSummaryCycles(t *testing.T) {
 	// effectively flush all the pending aggregation counters to an
 	// output metric, before the current aggregation_period has expired.
 
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	cl.Stop()
 
 	// One of the original input data points should have been dropped.  What
 	// we get back instead for that data point should be just the summary line.

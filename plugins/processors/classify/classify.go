@@ -931,17 +931,11 @@ func (cl *Classify) Add(metric telegraf.Metric, _ telegraf.Accumulator) error {
 // When Stop returns, you should no longer be writing metrics to the
 // accumulator.
 //
-func (cl *Classify) Stop() error {
+func (cl *Classify) Stop() {
 	// We must stop the classifier before we stop the aggregator, so the classifier
 	// does not keep counting data that will never be output by the aggregator.
-	//
-	// We stop both sides regardless, but prefer reporting a problem with stopping
-	// the classifier, if any.
-	err := cl.StopClassification()
-	if aggErr := cl.StopAggregation(); err == nil {
-		err = aggErr
-	}
-	return err
+	_ = cl.StopClassification()
+	_ = cl.StopAggregation()
 }
 
 // We factor out this helper function partly because the code is otherwise common
