@@ -923,6 +923,13 @@ func (cl *Classify) Add(metric telegraf.Metric, _ telegraf.Accumulator) error {
 }
 
 // Stop() gives you an opportunity to gracefully shut down the processor.
+func (clw *ClassifyWrapper) Stop() {
+	if err := clw.Classify.Stop(); err != nil {
+		clw.Log.Error(err)
+	}
+}
+
+// Stop() gives you an opportunity to gracefully shut down the processor.
 //
 // Once Stop() is called, Add() will not be called any more. If you are using
 // goroutines, you should wait for any in-progress metrics to be processed
