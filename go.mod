@@ -103,7 +103,7 @@ require (
 	github.com/gorilla/websocket v1.5.1
 	github.com/gosnmp/gosnmp v1.37.0
 	github.com/grid-x/modbus v0.0.0-20240503115206-582f2ab60a18
-	github.com/gwos/tcg/sdk v0.0.0-20231124052037-1e832b843240
+	github.com/gwos/tcg/sdk v0.0.0-20240718093700-d18535501a98
 	github.com/harlow/kinesis-consumer v0.3.6-0.20211204214318-c2b9f79d7ab6
 	github.com/hashicorp/consul/api v1.29.1
 	github.com/hashicorp/go-uuid v1.0.3

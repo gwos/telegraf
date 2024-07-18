@@ -4,15 +4,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gwos/tcg/sdk/clients"
+	sdklog "github.com/gwos/tcg/sdk/log"
 	"github.com/gwos/tcg/sdk/transit"
 	"github.com/stretchr/testify/require"
 
 	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/logger"
+	sloghandle "github.com/influxdata/telegraf/plugins/outputs/groundwork/slog"
 	"github.com/influxdata/telegraf/testutil"
 )
 
@@ -22,6 +26,13 @@ const (
 	defaultAppType     = "TELEGRAF"
 	customAppType      = "SYSLOG"
 )
+
+var testLogger = func() telegraf.Logger {
+	_ = logger.SetupLogging(&logger.Config{Debug: true})
+	l := new(testutil.Logger)
+	sdklog.Logger = slog.New((&sloghandle.SLogHandler{Log: l}))
+	return l
+}()
 
 func TestWriteWithDefaults(t *testing.T) {
 	// Generate test metric with default name to test Write logic
@@ -51,7 +62,7 @@ func TestWriteWithDefaults(t *testing.T) {
 	}))
 
 	i := Groundwork{
-		Log:            testutil.Logger{},
+		Log:            testLogger,
 		Server:         server.URL,
 		AgentID:        defaultTestAgentID,
 		DefaultHost:    defaultHost,
@@ -101,7 +112,7 @@ func TestWriteWithFields(t *testing.T) {
 	}))
 
 	i := Groundwork{
-		Log:            testutil.Logger{},
+		Log:            testLogger,
 		Server:         server.URL,
 		AgentID:        defaultTestAgentID,
 		DefaultHost:    defaultHost,
@@ -170,7 +181,7 @@ func TestWriteWithTags(t *testing.T) {
 	}))
 
 	i := Groundwork{
-		Log:            testutil.Logger{},
+		Log:            testLogger,
 		Server:         server.URL,
 		AgentID:        defaultTestAgentID,
 		DefaultHost:    defaultHost,
