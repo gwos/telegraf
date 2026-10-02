@@ -282,7 +282,8 @@ func TestWriteWithTags(t *testing.T) {
 	floatMetric.AddTag("status", "SERVICE_PENDING")
 	floatMetric.AddTag("group-tag", "Group01")
 	floatMetric.AddTag("resource-tag", "Host01")
-	floatMetric.AddTag("service", "Service01")
+	floatMetric.AddTag("alias-tag", "Host01 Alias")
+	floatMetric.AddTag("service-tag", "Service01")
 	floatMetric.AddTag("facility", "FACILITY")
 	floatMetric.AddTag("severity", "SEVERITY")
 
@@ -372,6 +373,14 @@ func TestWriteWithTags(t *testing.T) {
 				float64(6.0), *obj.Resources[0].Services[0].Metrics[0].Thresholds[1].Value.DoubleValue, testutil.DefaultDelta, dt)
 			return
 		}
+		for _, tag := range []string{"alias-tag", "service-tag"} {
+			if _, ok := obj.Resources[0].Services[0].Properties[tag]; ok {
+				w.WriteHeader(http.StatusInternalServerError)
+				t.Errorf("Unexpected service property %q", tag)
+				return
+			}
+		}
+		require.Equal(t, "Host01 Alias", *obj.Resources[0].Properties["Alias"].StringValue)
 
 		if _, err = fmt.Fprintln(w, "OK"); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -388,6 +397,8 @@ func TestWriteWithTags(t *testing.T) {
 		DefaultAppType: defaultAppType,
 		GroupTag:       "group-tag",
 		ResourceTag:    "resource-tag",
+		AliasTag:       "alias-tag",
+		ServiceTag:     "service-tag",
 		client: clients.GWClient{
 			AppName: "telegraf",
 			AppType: defaultAppType,
