@@ -169,7 +169,7 @@ func TestWriteWithDefaults(t *testing.T) {
 		client: clients.GWClient{
 			AppName: "telegraf",
 			AppType: customAppType,
-			GWConnection: &clients.GWConnection{
+			GWConnection: clients.GWConnection{
 				HostName: server.URL,
 			},
 		},
@@ -254,7 +254,7 @@ func TestWriteWithFields(t *testing.T) {
 		client: clients.GWClient{
 			AppName: "telegraf",
 			AppType: defaultAppType,
-			GWConnection: &clients.GWConnection{
+			GWConnection: clients.GWConnection{
 				HostName: server.URL,
 			},
 		},
@@ -388,7 +388,7 @@ func TestWriteWithTags(t *testing.T) {
 		client: clients.GWClient{
 			AppName: "telegraf",
 			AppType: defaultAppType,
-			GWConnection: &clients.GWConnection{
+			GWConnection: clients.GWConnection{
 				HostName: server.URL,
 			},
 		},

@@ -85,7 +85,7 @@ func (g *Groundwork) Init() error {
 	g.client = clients.GWClient{
 		AppName: "telegraf",
 		AppType: g.DefaultAppType,
-		GWConnection: &clients.GWConnection{
+		GWConnection: clients.GWConnection{
 			HostName:           g.Server,
 			UserName:           username.String(),
 			Password:           password.String(),
@@ -171,7 +171,7 @@ func (g *Groundwork) Write(metrics []telegraf.Metric) error {
 		return err
 	}
 	requestJSON, err := json.Marshal(transit.ResourcesWithServicesRequest{
-		Context: &transit.TracerContext{
+		Context: transit.TracerContext{
 			AppType:    g.DefaultAppType,
 			AgentID:    g.AgentID,
 			TraceToken: traceToken,
