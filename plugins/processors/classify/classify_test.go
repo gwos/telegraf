@@ -1,123 +1,52 @@
-// Unit-test routines for the Telegraf "classify" combined processor/aggregator.
-
 package classify
-
-// The tests in this file are designed to verify many aspects of the Telegraf
-// "classify" processor plugin.  There are a lot of little things we need to get
-// right, so the number of tests included here is much larger than you might see
-// in other plugins.
-
-// In this iteration of testing, some collections of sub-tests are combined
-// into a single test for the general aspect under scrutiny.  Whether we
-// might want to break those up into individual tests is open to opinion.
-
-// Some other aspects of plugin operation not explicitly tested here:
-// * logging in general; see [agent] options for that:
-//   * where logging output ends up
-//   * control of logging levels actually output
-//   * log rotation parameters
 
 import (
 	"fmt"
-	"regexp"
-	"runtime"
-	"runtime/debug"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/influxdata/toml"
+	"github.com/stretchr/testify/require"
+
 	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/metric"
 	"github.com/influxdata/telegraf/testutil"
-
-	"github.com/stretchr/testify/require"
 )
 
-var logSeparator = "----------------------------------------------------------------"
-
-// Routine to be called whenever there is a proposed test or part of a test
-// that is not yet implemented, so we don't lose track of the fact that the
-// work here is not yet done.
-func NotImplemented(t *testing.T, s ...string) {
-	pc := make([]uintptr, 15)
-	n := runtime.Callers(2, pc)
-	frames := runtime.CallersFrames(pc[:n])
-	frame, _ := frames.Next()
-	reg := regexp.MustCompile(`.*/(.*)`)
-	function := reg.ReplaceAllString(frame.Function, "${1}")
-	if len(s) > 0 {
-		t.Fatalf("Test not implemented: %s (%s)", function, s[0])
-	} else {
-		t.Fatalf("Test not implemented: %s", function)
-	}
+// testLogger returns a logger that only prints in verbose mode.
+func testLogger() telegraf.Logger {
+	return testutil.Logger{Quiet: !testing.Verbose()}
 }
 
-// It would be absurd for us to define a large number of tests and not
-// factor out their basic commonality.  Here is that boilerplate.
-func RunClassifyTest(t *testing.T, cl *Classify, metrics []telegraf.Metric, waitTime ...time.Duration) (acc *testutil.Accumulator, err error) {
-	// If the test panics, let's get the word out to where we can see it,
-	// with full details displayed, so we can easily debug the problem.
-	defer func() {
-		if p := recover(); p != nil {
-			fmt.Printf("panic: %v\n", p)
-			fmt.Println("stacktrace from panic: \n" + string(debug.Stack()))
-		}
-	}()
-
-	err = cl.Reset()
-	if err != nil {
-		err = fmt.Errorf("the Classify object could not be reset:\n%v", err)
-		return nil, err
-	}
-	acc = &testutil.Accumulator{}
-	err = cl.Start(acc)
-	if err != nil {
-		// This particular case, along with any later error return from
-		// RunClassifyTest(), risks the cl.syncWaitGroup being left with a
-		// non-zero count, which (because we have no way to clear that count
-		// in a future call to cl.Reset()) will then make it impossible for
-		// this particular *Classify object to successfully wait for the
-		// aggregation thread to complete in any future tests -- game over.
-		// There's not much we can do about that.
-		err = fmt.Errorf("the classify plugin could not be started:\n%v", err)
-		return acc, err
-	}
-	for _, oneMetric := range metrics {
-		err = cl.Add(oneMetric, acc)
-		if err != nil {
-			err = fmt.Errorf("a metric could not be added to the accumulator:\n%v", err)
-			return acc, err
-		}
+// runClassifyTest is a test helper that runs Init→Start→Add(metrics)→Stop
+// and returns the resulting accumulator. Failures are reported via t.
+func runClassifyTest(t *testing.T, cl *Classify, metrics []telegraf.Metric, waitTime ...time.Duration) *testutil.Accumulator {
+	t.Helper()
+	acc := &testutil.Accumulator{}
+	require.NoError(t, cl.Init())
+	require.NoError(t, cl.Start(acc))
+	for _, m := range metrics {
+		require.NoError(t, cl.Add(m, acc))
 	}
 	if len(waitTime) > 0 {
 		time.Sleep(waitTime[0])
 	}
-	err = cl.Stop()
-	if err != nil {
-		err = fmt.Errorf("the classify plugin could not be stopped:\n%v", err)
-		return acc, err
-	}
-	return acc, err
+	cl.Stop()
+	return acc
 }
 
-/*
-// Test the internal TOML parsing of a sample detailed config file.
-// This is worth implementing but has not been approached yet.
-func TestConfigDetailParsing(t *testing.T) {
-	NotImplemented(t, "pending some thought")
-}
-*/
-
-// This is a basic smoke test.  Is the plugin able to get up and running
-// at all?  Are we able to parse a config file that includes a full set
-// of non-conflicting options, with as much variation of style and content
-// as we can stuff into a single configuration?
+// TestParseFullConfig is a basic smoke test: can the plugin start and classify
+// a metric end-to-end with a full, valid configuration?
 func TestParseFullConfig(t *testing.T) {
 	cl := &Classify{
 		SelectorTag:     "host",
 		SelectorMapping: []map[string]string{{`pg\d{3}`: "database"}},
 		MatchField:      "message",
 		ResultTag:       "severity",
-		MappedSelectorRegexes: map[string][]map[string]interface{}{
+		MappedSelectorRegexes: map[string][]map[string]any{
 			"database": {
 				{"ignore": "IGNORE"},
 				{"okay": "OK"},
@@ -127,761 +56,429 @@ func TestParseFullConfig(t *testing.T) {
 			},
 		},
 	}
-	if testing.Verbose() {
-		cl.logger = &testutil.Logger{}
-	}
+	cl.Log = testLogger()
 
-	now := time.Now()
-	m := metric.New("datapoint", map[string]string{
-		"host": "pg123",
-	}, map[string]interface{}{
-		"message": "WARNING:  badness happened",
-	}, now)
-	metrics := make([]telegraf.Metric, 1)
-	metrics[0] = m
+	m := metric.New("datapoint",
+		map[string]string{"host": "pg123"},
+		map[string]any{"message": "WARNING:  badness happened"},
+		time.Now())
 
-	acc, err := RunClassifyTest(t, cl, metrics)
-	require.NoError(t, err)
+	acc := runClassifyTest(t, cl, []telegraf.Metric{m})
 	require.Len(t, acc.GetTelegrafMetrics(), 1)
 
-	processedMetric := acc.GetTelegrafMetrics()[0]
-	resultTag, ok := processedMetric.GetTag(cl.ResultTag)
-	require.Truef(t, ok, "could not find result tag %q in the returned metric", cl.ResultTag)
-	require.EqualValuesf(t, "warning", resultTag, "result tag %q value was not %q; output metric is:\n%v\n",
-		cl.ResultTag, "warning", processedMetric)
+	got := acc.GetTelegrafMetrics()[0]
+	resultTag, ok := got.GetTag(cl.ResultTag)
+	require.Truef(t, ok, "result tag %q not found in output metric", cl.ResultTag)
+	require.Equal(t, "warning", resultTag)
 }
 
-// Make sure that all variants of specifying a selector item work as desired.
-// * PASS:  No selector tag or selector field defined.
-// * PASS:  Only selector tag defined.
-// * FAIL:  Both selector tag and selector field defined.
-// * PASS:  Only selector field defined.
+// TestParseSelectorItem verifies all valid and invalid combinations of the
+// selector_tag / selector_field options.
 func TestParseSelectorItem(t *testing.T) {
-	cl := &Classify{
-		SelectorMapping: []map[string]string{{`pg\d{3}`: "database"}},
-		MatchField:      "message",
-		ResultTag:       "severity",
-		MappedSelectorRegexes: map[string][]map[string]interface{}{
-			"database": {
-				{"ignore": "IGNORE"},
-				{"okay": "OK"},
-				{"warning": "WARNING"},
-				{"critical": "CRITICAL"},
-				{"unknown": ".*"},
-			},
+	msr := map[string][]map[string]any{
+		"database": {
+			{"ignore": "IGNORE"}, {"okay": "OK"}, {"warning": "WARNING"},
+			{"critical": "CRITICAL"}, {"unknown": ".*"},
 		},
 	}
+	sm := []map[string]string{{`pg\d{3}`: "database"}}
 
-	acc := &testutil.Accumulator{}
-	var err error
-
-	// No selector tag or selector field.
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.NoError(t, err, "subtest:  no selector tag or selector field")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
-
-	// Only selector tag.
-	cl.SelectorTag = "host_tag"
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.NoError(t, err, "subtest:  only selector tag")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
-
-	// Both selector tag and selector field.
-	cl.SelectorField = "host_field"
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.Error(t, err, "subtest:  both selector tag and selector field")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
-
-	// Only selector field.
-	cl.SelectorTag = ""
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.NoError(t, err, "subtest:  only selector field")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	tests := []struct {
+		name          string
+		selectorTag   string
+		selectorField string
+		wantErr       bool
+	}{
+		{name: "no selector"},
+		{name: "only selector_tag", selectorTag: "host_tag"},
+		{name: "both selector_tag and selector_field", selectorTag: "host_tag", selectorField: "host_field", wantErr: true},
+		{name: "only selector_field", selectorField: "host_field"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cl := &Classify{
+				SelectorTag:           tt.selectorTag,
+				SelectorField:         tt.selectorField,
+				SelectorMapping:       sm,
+				DefaultRegexGroup:     "database",
+				MatchField:            "message",
+				ResultTag:             "severity",
+				MappedSelectorRegexes: msr,
+			}
+			cl.Log = testLogger()
+			if tt.wantErr {
+				require.Error(t, cl.Init())
+				return
+			}
+			acc := &testutil.Accumulator{}
+			require.NoError(t, cl.Init())
+			require.NoError(t, cl.Start(acc))
+			cl.Stop()
+		})
+	}
 }
 
-// Make sure that all variants of specifying a match item work as desired.
-// * FAIL:  No match tag or match field defined.
-// * PASS:  Only match tag defined.
-// * FAIL:  Both match tag and match field defined.
-// * PASS:  Only match field defined.
+// TestParseMatchItem verifies all valid and invalid combinations of the
+// match_tag / match_field options.
 func TestParseMatchItem(t *testing.T) {
-	cl := &Classify{
-		SelectorMapping: []map[string]string{{`pg\d{3}`: "database"}},
-		ResultTag:       "severity",
-		MappedSelectorRegexes: map[string][]map[string]interface{}{
-			"database": {
-				{"ignore": "IGNORE"},
-				{"okay": "OK"},
-				{"warning": "WARNING"},
-				{"critical": "CRITICAL"},
-				{"unknown": ".*"},
-			},
+	msr := map[string][]map[string]any{
+		"database": {
+			{"ignore": "IGNORE"}, {"okay": "OK"}, {"warning": "WARNING"},
+			{"critical": "CRITICAL"}, {"unknown": ".*"},
 		},
 	}
+	sm := []map[string]string{{`pg\d{3}`: "database"}}
 
-	acc := &testutil.Accumulator{}
-	var err error
-
-	// No match tag or match field.
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.Error(t, err, "subtest:  no match tag or match field")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
-
-	// Only match tag.
-	cl.MatchTag = "message_tag"
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.NoError(t, err, "subtest:  only match tag")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
-
-	// Both match tag and match field.
-	cl.MatchField = "message_field"
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.Error(t, err, "subtest:  both match tag and match field")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
-
-	// Only match field.
-	cl.MatchTag = ""
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.NoError(t, err, "subtest:  only match field")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	tests := []struct {
+		name       string
+		matchTag   string
+		matchField string
+		wantErr    bool
+	}{
+		{name: "no match tag or field", wantErr: true},
+		{name: "only match_tag", matchTag: "message_tag"},
+		{name: "both match_tag and match_field", matchTag: "message_tag", matchField: "message_field", wantErr: true},
+		{name: "only match_field", matchField: "message_field"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cl := &Classify{
+				SelectorMapping:       sm,
+				DefaultRegexGroup:     "database",
+				MatchTag:              tt.matchTag,
+				MatchField:            tt.matchField,
+				ResultTag:             "severity",
+				MappedSelectorRegexes: msr,
+			}
+			cl.Log = testLogger()
+			if tt.wantErr {
+				require.Error(t, cl.Init())
+				return
+			}
+			acc := &testutil.Accumulator{}
+			require.NoError(t, cl.Init())
+			require.NoError(t, cl.Start(acc))
+			cl.Stop()
+		})
+	}
 }
 
-// Make sure that all variants of specifying a result item work as desired.
-// * FAIL:  No result tag or result field defined.
-// * PASS:  Only result tag defined.
-// * FAIL:  Both result tag and result field defined.
-// * PASS:  Only result field defined.
+// TestParseResultItem verifies all valid and invalid combinations of the
+// result_tag / result_field options.
 func TestParseResultItem(t *testing.T) {
-	cl := &Classify{
-		SelectorMapping: []map[string]string{{`pg\d{3}`: "database"}},
-		MatchField:      "message",
-		MappedSelectorRegexes: map[string][]map[string]interface{}{
-			"database": {
-				{"ignore": "IGNORE"},
-				{"okay": "OK"},
-				{"warning": "WARNING"},
-				{"critical": "CRITICAL"},
-				{"unknown": ".*"},
-			},
+	msr := map[string][]map[string]any{
+		"database": {
+			{"ignore": "IGNORE"}, {"okay": "OK"}, {"warning": "WARNING"},
+			{"critical": "CRITICAL"}, {"unknown": ".*"},
 		},
 	}
+	sm := []map[string]string{{`pg\d{3}`: "database"}}
 
-	acc := &testutil.Accumulator{}
-	var err error
-
-	// No result tag or result field.
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.Error(t, err, "subtest:  no result tag or result field")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
-
-	// Only result tag.
-	cl.ResultTag = "severity_tag"
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.NoError(t, err, "subtest:  only result tag")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
-
-	// Both result tag and result field.
-	cl.ResultField = "severity_field"
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.Error(t, err, "subtest:  both result tag and result field")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
-
-	// Only result field.
-	cl.ResultTag = ""
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.NoError(t, err, "subtest:  only result field")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	tests := []struct {
+		name        string
+		resultTag   string
+		resultField string
+		wantErr     bool
+	}{
+		{name: "no result tag or field", wantErr: true},
+		{name: "only result_tag", resultTag: "severity_tag"},
+		{name: "both result_tag and result_field", resultTag: "severity_tag", resultField: "severity_field", wantErr: true},
+		{name: "only result_field", resultField: "severity_field"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cl := &Classify{
+				SelectorMapping:       sm,
+				DefaultRegexGroup:     "database",
+				MatchField:            "message",
+				ResultTag:             tt.resultTag,
+				ResultField:           tt.resultField,
+				MappedSelectorRegexes: msr,
+			}
+			cl.Log = testLogger()
+			if tt.wantErr {
+				require.Error(t, cl.Init())
+				return
+			}
+			acc := &testutil.Accumulator{}
+			require.NoError(t, cl.Init())
+			require.NoError(t, cl.Start(acc))
+			cl.Stop()
+		})
+	}
 }
 
-// Test the ability of the plugin to output a sample configuration file.
+// TestReturnSampleConfig verifies that SampleConfig returns non-empty content.
 func TestReturnSampleConfig(t *testing.T) {
 	cl := &Classify{}
-	sampleConfig := cl.SampleConfig()
-	require.Contains(t, sampleConfig, "detailed configuration data for the classify plugin",
-		"content of sample configuration is not as expected")
+	require.NotEmpty(t, cl.SampleConfig(), "SampleConfig must return non-empty content")
 }
 
-/*
-// Run a a basic end-to-end smoke test, as a means of proving out the
-// overall logic flow rather than any particular aspect of it.
-// (The question is, would such a test be useful in some way that we
-// have not already dealt with in other tests?)
-func TestMatchMetric(t *testing.T) {
-	NotImplemented(t, "pending some thought")
-}
-*/
-
-// Test various forms of selector mapping, both valid and invalid, at this point
-// consolidated to run all in one overall test:
-//
-// * no selector_mapping at all is provided, and no default_regex_group is defined
-// * XXXX:  No selector mapping at all is defined.                             (selector item value should be used unchanged)
-
-// * no selector_mapping at all is provided, and a default_regex_group is provided
-//   that does not name one of the mapped_selector_regexes groups
-// * XXXX:  No selector mapping at all is defined.                             (selector item value should be used unchanged)
-
-// * no selector_mapping at all is provided, and a default_regex_group is provided
-//   that names one of the mapped_selector_regexes groups
-// * XXXX:  No selector mapping at all is defined.                             (selector item value should be used unchanged)
-
-// * XXXX:  Selector map regex is an empty string.                             (the configuration should be rejected)
-// * XXXX:  Selector map regex is a non-empty literal string.                  (this alone is not any kind of special condition)
-// * XXXX:  Selector map regex is unparseable as a regex.                      (the configuration should be rejected)
-// * XXXX:  Selector map regex is a valid regex.                               (this alone is not any kind of special condition)
-// * XXXX:  Selector matches; map value is an empty string.                    (input data point should be dropped)
-// * XXXX:  Selector matches; map value is the special string "*".             (selector item value should be used unchanged)
-// * XXXX:  Selector matches; map value matches some match-regex group.        (use the mapped selector item value as the regex group)
-// * XXXX:  Selector matches; map value does not match any match-regex group.  (SPECIAL HANDLING:  use the last configured regex group)
-// * XXXX:  Selector mapping is non-empty; selector does not match any key.    (SPECIAL HANDLING:  use the last configured regex group)
-
-// * selector item value matches a selector_mapping entry, and no default_regex_group is provided
-// * selector item value does not match any selector_mapping entry, and no default_regex_group is provided
-// * selector item value does not match any selector_mapping entry, and a default_regex_group
-//   is provided that names one of the mapped_selector_regexes groups
-// * selector item maps to an empty string
-// * selector item maps to '*', and there is no default regex group in play
-// * selector item maps to '*', and there is a valid default regex group in play
-// * selector item maps to some value which is not one of the mapped_selector_regexes groups
-// * selector map uses a valid regex for matching
-// * selector map uses Listed Order (with multiple mapping elements)
-//
-// In all of these tests, we ought to somehow be able to test the result of just
-// the mapping, not just the whole-metric-matching result.  That said, I'm not
-// sure there is any way to do that, unless we capture intermediate results in
-// Classify{} structure elements for test purposes, so they can be examined by
-// unit-test code.  We would also need to be careful to zero out those elements
-// between metrics, so as not to get confused by the intermediate results from
-// earlier metrics.
-//
-func TestSelectorMapping(t *testing.T) {
-	cl := &Classify{
-		SelectorTag: "host",
-		MatchField:  "message",
-		ResultTag:   "severity",
-		MappedSelectorRegexes: map[string][]map[string]interface{}{
-			"database": {
-				{"ignore": "IGNORE"},
-				{"okay": "OK"},
-				{"warning": "WARNING"},
-				{"critical": "CRITICAL"},
-				{"unknown": ".*"},
-			},
-		},
-	}
-	if testing.Verbose() {
-		cl.logger = &testutil.Logger{}
-	}
-
-	now := time.Now()
-	m := metric.New("datapoint", map[string]string{
-		"host": "pg123",
-	}, map[string]interface{}{
-		"message": "WARNING:  badness happened",
-	}, now)
-	metrics := make([]telegraf.Metric, 1)
-	metrics[0] = m
-
-	var acc *testutil.Accumulator
-	var err error
-
-	// In theory, we could use better after-action tests here, to verify whether the
-	// expected regex group got used when the data point was not dropped.  However,
-	// in these tests we are only supplying one regex group, so that is effectively
-	// checked for us even though we don't have any direct mechanism for detecting
-	// that internal transient result of the processing.
-
-	// NOTE:  Some of the log messages recorded here are out of date, but they give
-	// the general flavor of what gets logged.
-
-	// * no selector_mapping at all is provided (meaning, the user did not define
-	//   selector_mapping in the config file, so cl.SelectorMapping will be nil),
-	//   and no default_regex_group is defined
-	// get back in the log:
-	// selector item value "pg123" does not match anything in the selector_mapping
-	// dropping point (selector item value "pg123" maps to an empty string)
-	acc, err = RunClassifyTest(t, cl, metrics)
-	require.NoError(t, err, "subtest:  no selector_mapping at all is provided, and no default_regex_group is defined")
-	require.Len(t, acc.GetTelegrafMetrics(), 0)
-	if cl.logger != nil {
-		cl.logger.Info(logSeparator)
-	}
-
-	// * no selector_mapping at all is provided, and a default_regex_group is provided
-	//   that does not name one of the mapped_selector_regexes groups
-	// get back in the log:
-	// selector item value "pg123" does not match anything in the selector_mapping
-	// selector item value "pg123" maps to "foobar", which does not match any mapped_selector_regexes group
-	// dropping point (selector item mapped value "foobar" does not match any mapped_selector_regexes group)
-	cl.DefaultRegexGroup = "foobar"
-	acc, err = RunClassifyTest(t, cl, metrics)
-	require.NoError(t, err, "subtest:  no selector_mapping at all is provided, and default_regex_group does not name an existing group")
-	require.Len(t, acc.GetTelegrafMetrics(), 0)
-	if cl.logger != nil {
-		cl.logger.Info(logSeparator)
-	}
-
-	// * no selector_mapping at all is provided, and a default_regex_group is provided
-	//   that names one of the mapped_selector_regexes groups
-	// get back in the log:
-	// selector item value "pg123" does not match anything in the selector_mapping
-	cl.DefaultRegexGroup = "database"
-	acc, err = RunClassifyTest(t, cl, metrics)
-	require.NoError(t, err, "subtest:  no selector_mapping at all is provided, and default_regex_group names an existing group")
-	require.Len(t, acc.GetTelegrafMetrics(), 1)
-	if cl.logger != nil {
-		cl.logger.Info(logSeparator)
-	}
-
-	// * selector item value matches a selector_mapping entry, and no default_regex_group is provided
-	// get back in the log:
-	// (nothing additional logged for this sub-test)
-	cl.SelectorMapping = []map[string]string{{`pg123`: "database"}}
-	cl.DefaultRegexGroup = ""
-	acc, err = RunClassifyTest(t, cl, metrics)
-	require.NoError(t, err, "subtest:  selector item value matches a selector_mapping entry")
-	require.Len(t, acc.GetTelegrafMetrics(), 1)
-	if cl.logger != nil {
-		cl.logger.Info(logSeparator)
-	}
-
-	// * selector item value does not match any selector_mapping entry, and no default_regex_group is provided
-	// get back in the log:
-	// selector item value "pg123" does not match anything in the selector_mapping
-	// dropping point (selector item value "pg123" maps to an empty string)
-	cl.SelectorMapping = []map[string]string{{`abcde`: "database"}}
-	acc, err = RunClassifyTest(t, cl, metrics)
-	require.NoError(t, err, "subtest:  selector item value does not match any selector_mapping entry")
-	require.Len(t, acc.GetTelegrafMetrics(), 0)
-	if cl.logger != nil {
-		cl.logger.Info(logSeparator)
-	}
-
-	// * selector item value does not match any selector_mapping entry, and a default_regex_group
-	//   is provided that names one of the mapped_selector_regexes groups
-	// get back in the log:
-	// selector item value "pg123" does not match anything in the selector_mapping
-	cl.SelectorMapping = []map[string]string{{`abcde`: "database"}}
-	cl.DefaultRegexGroup = "database"
-	acc, err = RunClassifyTest(t, cl, metrics)
-	require.NoError(t, err, "subtest:  selector item value does not match any selector_mapping entry")
-	require.Len(t, acc.GetTelegrafMetrics(), 1)
-	if cl.logger != nil {
-		cl.logger.Info(logSeparator)
-	}
-
-	// * selector item maps to an empty string
-	// get back in the log:
-	// dropping point (selector item value "pg123" maps to an empty string)
-	cl.SelectorMapping = []map[string]string{{`pg123`: ""}}
-	acc, err = RunClassifyTest(t, cl, metrics)
-	require.NoError(t, err, "subtest:  selector item maps to an empty string")
-	require.Len(t, acc.GetTelegrafMetrics(), 0)
-	if cl.logger != nil {
-		cl.logger.Info(logSeparator)
-	}
-
-	// * selector item maps to '*', and there is no default regex group in play
-	// get back in the log:
-	// selector item value "pg123" maps to "pg123", which does not match any mapped_selector_regexes group
-	// dropping point (selector item mapped value "pg123" does not match any mapped_selector_regexes group)
-	cl.SelectorMapping = []map[string]string{{`pg123`: "*"}}
-	cl.DefaultRegexGroup = ""
-	acc, err = RunClassifyTest(t, cl, metrics)
-	require.NoError(t, err, "subtest:  selector item maps to '*', and there is no default regex group in play")
-	require.Len(t, acc.GetTelegrafMetrics(), 0)
-	if cl.logger != nil {
-		cl.logger.Info(logSeparator)
-	}
-
-	// * selector item maps to '*', and there is a valid default regex group in play
-	// get back in the log:
-	// selector item value "pg123" maps to "pg123", which does not match any mapped_selector_regexes group
-	// attempting category regex matches
-	// selector item value "pg123" mapped to regex group "database", which has 5 categories
-	// matching category "ignore", which has 1 regexes
-	// matching against regex "IGNORE"
-	// matching category "okay", which has 1 regexes
-	// matching against regex "OK"
-	// matching category "warning", which has 1 regexes
-	// matching against regex "WARNING"
-	// found match
-	// matched category "warning"
-	// setting result tag "severity" to "warning"
-	cl.SelectorMapping = []map[string]string{{`pg123`: "*"}}
-	cl.DefaultRegexGroup = "database"
-	acc, err = RunClassifyTest(t, cl, metrics)
-	require.NoError(t, err, "subtest:  selector item maps to '*', and there is a valid default regex group in play")
-	require.Len(t, acc.GetTelegrafMetrics(), 1)
-	if cl.logger != nil {
-		cl.logger.Info(logSeparator)
-	}
-
-	// * selector item maps to some value which is not one of the mapped_selector_regexes groups
-	// get back in the log:
-	// dropping point (selector item value "pg123" maps to "foobar", which does not match any mapped_selector_regexes group)
-	cl.SelectorMapping = []map[string]string{{`pg123`: "foobar"}}
-	cl.DefaultRegexGroup = ""
-	acc, err = RunClassifyTest(t, cl, metrics)
-	require.NoError(t, err, "subtest:  selector item maps to some value which is not one of the mapped_selector_regexes groups")
-	require.Len(t, acc.GetTelegrafMetrics(), 0)
-	if cl.logger != nil {
-		cl.logger.Info(logSeparator)
-	}
-
-	// * selector map uses a valid regex for matching
-	// get back in the log:
-	// (nothing additional logged for this sub-test)
-	cl.SelectorMapping = []map[string]string{{`pg\d{3}`: "database"}}
-	acc, err = RunClassifyTest(t, cl, metrics)
-	require.NoError(t, err, "subtest:  selector map uses a valid regex for matching")
-	require.Len(t, acc.GetTelegrafMetrics(), 1)
-	if cl.logger != nil {
-		cl.logger.Info(logSeparator)
-	}
-
-	// * selector map uses Listed Order (with multiple mapping elements)
-	//   (well, because of difficulty in parsing polymorphic forms of this
-	//   mapping, we have not restricted ourselves to only supporting the
-	//   Listed Order format, but at least here in this test we supply more
-	//   than one mapping)
-	// get back in the log:
-	// (nothing additional logged for this sub-test)
-	cl.SelectorMapping = []map[string]string{
-		{`fire\d{3}`: "firewall"},
-		{`desk\d{3}`: "desktop"},
-		{`pg\d{3}`: "database"},
-	}
-	acc, err = RunClassifyTest(t, cl, metrics)
-	require.NoError(t, err, "subtest:  selector map uses Listed Order")
-	require.Len(t, acc.GetTelegrafMetrics(), 1)
-}
-
-// Test what happens if the user supplies an invalid selector regex.
+// TestBadSelectorRegex verifies that invalid selector_mapping regexes are rejected.
 func TestBadSelectorRegex(t *testing.T) {
-	cl := &Classify{
-		SelectorTag: "host",
-		MatchField:  "message",
-		ResultTag:   "severity",
-		MappedSelectorRegexes: map[string][]map[string]interface{}{
-			"database": {
-				{"ignore": "IGNORE"},
-			},
-		},
+	msr := map[string][]map[string]any{"database": {{"ignore": "IGNORE"}}}
+
+	tests := []struct {
+		name    string
+		regex   string
+		wantErr bool
+	}{
+		{name: "valid selector regex", regex: `pg\d{3}`},
+		{name: "bad selector regex", regex: `*pg\d{3}`, wantErr: true},
+		{name: "empty selector regex", wantErr: true},
 	}
-	if testing.Verbose() {
-		cl.logger = &testutil.Logger{}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cl := &Classify{
+				SelectorTag:           "host",
+				SelectorMapping:       []map[string]string{{tt.regex: "database"}},
+				MatchField:            "message",
+				ResultTag:             "severity",
+				MappedSelectorRegexes: msr,
+			}
+			cl.Log = testLogger()
+			if tt.wantErr {
+				require.Error(t, cl.Init())
+			} else {
+				require.NoError(t, cl.Init())
+			}
+		})
 	}
-
-	acc := &testutil.Accumulator{}
-
-	// Test the behavior if a selector_mapping pattern compiles as a regex.
-	cl.SelectorMapping = []map[string]string{{`pg\d{3}`: "database"}}
-	err := cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.NoError(t, err, "subtest:  good selector mapping regex")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
-
-	// Test the behavior if a selector_mapping pattern won't compile as a regex.
-	cl.SelectorMapping = []map[string]string{{`*pg\d{3}`: "database"}}
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.Error(t, err, "subtest:  bad selector_mapping regex [bad repetition]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
-
-	// Test the behavior if an empty selector_mapping pattern is specified.
-	cl.SelectorMapping = []map[string]string{{``: "database"}}
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.Error(t, err, "subtest:  bad selector_mapping regex [empty regex]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
 }
 
-// Test the error handling if a category regex is not specified as either a
-// single string, a multi-line string, or an array of strings -- perhaps
-// the user specifies some other TOML type, like an integer, instead.
+// TestBadCategoryRegexType verifies that all supported and unsupported value
+// types for mapped_selector_regexes category entries are handled correctly.
 func TestBadCategoryRegexType(t *testing.T) {
-	cl := &Classify{
-		SelectorTag:           "host",
-		SelectorMapping:       []map[string]string{{`pg\d{3}`: "database"}},
-		MatchField:            "message",
-		ResultTag:             "severity",
-		MappedSelectorRegexes: map[string][]map[string]interface{}{},
-	}
-	if testing.Verbose() {
-		cl.logger = &testutil.Logger{}
-	}
-
-	acc := &testutil.Accumulator{}
-
-	// Single string.
-	cl.MappedSelectorRegexes["test-group"] = []map[string]interface{}{
-		{"ignore": "IGNORE"},
-	}
-	err := cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.NoError(t, err, "subtest:  good category regex type [single-string]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
-
-	// Multi-line string.
-	// Here we simulate what we will get back from a TOML Multi-line literal
-	// string that the user has specified using whitespace indentation for
-	// regexes and placing the terminating delimeter on its own line.
-	// Our plugin's internal parsing of that string, taking it apart into
-	// its constituent regexes, should be able to hand this.
-	cl.MappedSelectorRegexes["test-group"] = []map[string]interface{}{
-		{"ignore": "    IGNORE\n    DO NOT CARE\n    FUGGEDDABOUDIT\n    "},
-	}
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.NoError(t, err, "subtest:  good category regex type [multi-line string]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
-
-	// Multi-line string, containing some invisible whitespace immediately
-	// after the opening delimiter in a multi-line literal string, before
-	// the newline at the end of that line.
-	cl.MappedSelectorRegexes["test-group"] = []map[string]interface{}{
-		{"ignore": "  \n    IGNORE\n    DO NOT CARE\n    FUGGEDDABOUDIT\n    "},
-	}
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.NoError(t, err, "subtest:  good category regex type [multi-line string with invisible leading whitespace]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
-
-	// Multi-line string, containing just the whitespace at the beginning of a line.
-	// This would be the case if the user used the form of a multi-line literal
-	// string, but did not include any regexes within that string, so there is
-	// only the opening delimiter (and its following newline, which is suppressed),
-	// and whitespace on the next line before the closing delimiter.
-	cl.MappedSelectorRegexes["test-group"] = []map[string]interface{}{
-		{"ignore": "    "},
-	}
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.NoError(t, err, "subtest:  good category regex type [multi-line string containing no regexes]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
-
-	// Array of strings.
-	cl.MappedSelectorRegexes["test-group"] = []map[string]interface{}{
-		{"ignore": []string{"IGNORE", "DO NOT CARE", "FUGGEDDABOUDIT"}},
-	}
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.NoError(t, err, "subtest:  good category regex type [array-of-strings]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
-
-	cl.MappedSelectorRegexes["test-group"] = []map[string]interface{}{
-		{"ignore": nil},
-	}
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.Error(t, err, "subtest:  bad category regex type [nil-value]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
-
 	myString := "IGNORE"
-	cl.MappedSelectorRegexes["test-group"] = []map[string]interface{}{
-		{"ignore": &myString},
-	}
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.Error(t, err, "subtest:  bad category regex type [ptr-to-string]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
 
-	cl.MappedSelectorRegexes["test-group"] = []map[string]interface{}{
-		{"ignore": 42},
+	tests := []struct {
+		name    string
+		value   any
+		wantErr bool
+	}{
+		{name: "single string regex", value: "IGNORE"},
+		{name: "multi-line string regex", value: "    IGNORE\n    DO NOT CARE\n    FUGGEDDABOUDIT\n    "},
+		{name: "multi-line string with leading whitespace", value: "  \n    IGNORE\n    DO NOT CARE\n    "},
+		{name: "multi-line string with no regexes", value: "    "},
+		{name: "array of strings regex", value: []string{"IGNORE", "DO NOT CARE", "FUGGEDDABOUDIT"}},
+		{name: "nil regex value", value: nil, wantErr: true},
+		{name: "pointer-to-string regex value", value: &myString, wantErr: true},
+		{name: "integer regex value", value: 42, wantErr: true},
 	}
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.Error(t, err, "subtest:  bad category regex type [integer]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cl := &Classify{
+				SelectorTag:     "host",
+				SelectorMapping: []map[string]string{{`pg\d{3}`: "database"}},
+				MatchField:      "message",
+				ResultTag:       "severity",
+				MappedSelectorRegexes: map[string][]map[string]any{
+					"test-group": {{"ignore": tt.value}},
+				},
+			}
+			cl.Log = testLogger()
+			if tt.wantErr {
+				require.Error(t, cl.Init())
+				return
+			}
+			acc := &testutil.Accumulator{}
+			require.NoError(t, cl.Init())
+			require.NoError(t, cl.Start(acc))
+			cl.Stop()
+		})
+	}
 }
 
-// Test what happens if the user supplies an invalid category regex.
+// TestBadCategoryRegex verifies that invalid category regex content is rejected.
 func TestBadCategoryRegex(t *testing.T) {
-	cl := &Classify{
-		SelectorTag:           "host",
-		SelectorMapping:       []map[string]string{{`pg\d{3}`: "database"}},
-		MatchField:            "message",
-		ResultTag:             "severity",
-		MappedSelectorRegexes: map[string][]map[string]interface{}{},
-	}
-	if testing.Verbose() {
-		cl.logger = &testutil.Logger{}
-	}
-
-	acc := &testutil.Accumulator{}
-
-	// Test the behavior if a duplicate category is listed for a single
-	// mapped_selector_regexes group.
-	cl.MappedSelectorRegexes["test-group"] = []map[string]interface{}{
-		{"ignore": "foobar"},
-		{"ignore": "barfoo"},
-	}
-	err := cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.Error(t, err, "subtest:  duplicate category for the same mapped_selector_regexes group [bad repetition]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
-
-	// Test the behavior if a mapped_selector_regexes regex won't compile as a regex.
-	cl.MappedSelectorRegexes["test-group"] = []map[string]interface{}{
-		{"ignore": "*foobar"},
-	}
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.Error(t, err, "subtest:  bad mapped_selector_regexes regex [bad repetition]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
-
-	// Test the behavior if an empty mapped_selector_regexes regex is specified.
-	cl.MappedSelectorRegexes["test-group"] = []map[string]interface{}{
-		{"ignore": ""},
-	}
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.Error(t, err, "subtest:  bad mapped_selector_regexes regex [empty regex]")
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
-}
-
-// Test whatever it is we want to do with the default_category option.
-// The only sensible thing is to have an input data point that does not
-// match any category regexes, then test what happens with and without
-// the default_category option defined.  If it is not defined, the data
-// point should be dropped.  If it is defined as a non-empty string, the
-// default_category option value should be used as the result item value.
-func TestDefaultCategory(t *testing.T) {
-	cl := &Classify{
-		SelectorTag:     "host",
-		SelectorMapping: []map[string]string{{`pg\d{3}`: "database"}},
-		MatchField:      "message",
-		ResultTag:       "severity",
-		MappedSelectorRegexes: map[string][]map[string]interface{}{
-			"database": {
-				{"ignore": "IGNORE"},
-				{"okay": "OKAY"},
-				{"warning": "WARNING"},
-				{"critical": "CRITICAL"},
-				{"unknown": "UNKNOWN"},
-			},
+	tests := []struct {
+		name    string
+		entries []map[string]any
+	}{
+		{
+			name:    "duplicate category in same group",
+			entries: []map[string]any{{"ignore": "foobar"}, {"ignore": "barfoo"}},
+		},
+		{
+			name:    "bad category regex",
+			entries: []map[string]any{{"ignore": "*foobar"}},
+		},
+		{
+			name:    "empty category regex",
+			entries: []map[string]any{{"ignore": ""}},
 		},
 	}
-	if testing.Verbose() {
-		cl.logger = &testutil.Logger{}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cl := &Classify{
+				SelectorTag:     "host",
+				SelectorMapping: []map[string]string{{`pg\d{3}`: "database"}},
+				MatchField:      "message",
+				ResultTag:       "severity",
+				MappedSelectorRegexes: map[string][]map[string]any{
+					"test-group": tt.entries,
+				},
+			}
+			cl.Log = testLogger()
+			require.Error(t, cl.Init())
+		})
 	}
+}
 
-	now := time.Now()
-	m := metric.New("datapoint", map[string]string{
-		"host": "pg123",
-	}, map[string]interface{}{
-		"message": "this message contains no category name",
-	}, now)
-	metrics := make([]telegraf.Metric, 1)
-	metrics[0] = m
-
-	acc, err := RunClassifyTest(t, cl, metrics)
-	require.NoError(t, err, "subtest:  default_category is not supplied")
-	require.Len(t, acc.GetTelegrafMetrics(), 0)
-	if cl.logger != nil {
-		cl.logger.Info(logSeparator)
+// TestSelectorMapping exercises the full range of selector_mapping behaviours.
+func TestSelectorMapping(t *testing.T) {
+	msr := map[string][]map[string]any{
+		"database": {
+			{"ignore": "IGNORE"}, {"okay": "OK"}, {"warning": "WARNING"},
+			{"critical": "CRITICAL"}, {"unknown": ".*"},
+		},
 	}
+	m := metric.New("datapoint",
+		map[string]string{"host": "pg123"},
+		map[string]any{"message": "WARNING:  badness happened"},
+		time.Now())
 
-	cl.DefaultCategory = "unmatched"
-	acc, err = RunClassifyTest(t, cl, metrics)
-	require.NoError(t, err, "subtest:  default_category is supplied as a non-empty string")
-	require.Len(t, acc.GetTelegrafMetrics(), 1)
-	processedMetric := acc.GetTelegrafMetrics()[0]
-	resultTag, ok := processedMetric.GetTag(cl.ResultTag)
-	require.Truef(t, ok, "could not find result tag %q in the returned metric", cl.ResultTag)
-	require.EqualValuesf(t, cl.DefaultCategory, resultTag, "result tag %q value was not %q", cl.ResultTag, cl.DefaultCategory)
+	tests := []struct {
+		name            string
+		selectorMapping []map[string]string
+		defaultGroup    string
+		wantCount       int
+		wantInitErr     bool
+	}{
+		{
+			name:      "no selector_mapping and no default_regex_group",
+			wantCount: 0,
+		},
+		{
+			name:         "default_regex_group names nonexistent group",
+			defaultGroup: "foobar",
+			wantInitErr:  true,
+		},
+		{
+			name:         "default_regex_group names existing group",
+			defaultGroup: "database",
+			wantCount:    1,
+		},
+		{
+			name:            "selector matches entry",
+			selectorMapping: []map[string]string{{`pg123`: "database"}},
+			wantCount:       1,
+		},
+		{
+			name:            "selector matches nothing, no default",
+			selectorMapping: []map[string]string{{`abcde`: "database"}},
+			wantCount:       0,
+		},
+		{
+			name:            "selector matches nothing, valid default",
+			selectorMapping: []map[string]string{{`abcde`: "database"}},
+			defaultGroup:    "database",
+			wantCount:       1,
+		},
+		{
+			name:            "selector maps to empty string",
+			selectorMapping: []map[string]string{{`pg123`: ""}},
+			wantCount:       0,
+		},
+		{
+			name:            "selector maps to *, no default",
+			selectorMapping: []map[string]string{{`pg123`: "*"}},
+			wantCount:       0,
+		},
+		{
+			name:            "selector maps to *, valid default",
+			selectorMapping: []map[string]string{{`pg123`: "*"}},
+			defaultGroup:    "database",
+			wantCount:       1,
+		},
+		{
+			name:            "selector maps to unknown group",
+			selectorMapping: []map[string]string{{`pg123`: "foobar"}},
+			wantCount:       0,
+		},
+		{
+			name:            "selector uses valid regex",
+			selectorMapping: []map[string]string{{`pg\d{3}`: "database"}},
+			wantCount:       1,
+		},
+		{
+			name: "multiple ordered selector entries",
+			selectorMapping: []map[string]string{
+				{`fire\d{3}`: "firewall"},
+				{`desk\d{3}`: "desktop"},
+				{`pg\d{3}`: "database"},
+			},
+			wantCount: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cl := &Classify{
+				SelectorTag:           "host",
+				SelectorMapping:       tt.selectorMapping,
+				DefaultRegexGroup:     tt.defaultGroup,
+				MatchField:            "message",
+				ResultTag:             "severity",
+				MappedSelectorRegexes: msr,
+			}
+			cl.Log = testLogger()
+			if tt.wantInitErr {
+				require.ErrorContains(t, cl.Init(), "default_regex_group")
+				return
+			}
+			acc := runClassifyTest(t, cl, []telegraf.Metric{m})
+			require.Len(t, acc.GetTelegrafMetrics(), tt.wantCount)
+		})
+	}
 }
 
-/*
-// Test various ways in which a metric might be dropped.
-// * metric matched, but its match category was in drop_categories
-// * (list other cases as well, as they occur to me)
-func TestDroppedMetric(t *testing.T) {
-	NotImplemented(t, "pending some thought")
+// TestDefaultCategory verifies that default_category is applied when no regex
+// matches, and that metrics are dropped when it is not configured.
+func TestDefaultCategory(t *testing.T) {
+	msr := map[string][]map[string]any{
+		"database": {
+			{"ignore": "IGNORE"}, {"okay": "OKAY"},
+			{"warning": "WARNING"}, {"critical": "CRITICAL"}, {"unknown": "UNKNOWN"},
+		},
+	}
+	m := metric.New("datapoint",
+		map[string]string{"host": "pg123"},
+		map[string]any{"message": "this message contains no category name"},
+		time.Now())
+
+	tests := []struct {
+		name            string
+		defaultCategory string
+		wantCount       int
+	}{
+		{name: "no default_category", wantCount: 0},
+		{name: "default_category set", defaultCategory: "unmatched", wantCount: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cl := &Classify{
+				SelectorTag:           "host",
+				SelectorMapping:       []map[string]string{{`pg\d{3}`: "database"}},
+				MatchField:            "message",
+				ResultTag:             "severity",
+				DefaultCategory:       tt.defaultCategory,
+				MappedSelectorRegexes: msr,
+			}
+			cl.Log = testLogger()
+			acc := runClassifyTest(t, cl, []telegraf.Metric{m})
+			require.Len(t, acc.GetTelegrafMetrics(), tt.wantCount)
+			if tt.wantCount > 0 {
+				got := acc.GetTelegrafMetrics()[0]
+				resultTag, ok := got.GetTag(cl.ResultTag)
+				require.Truef(t, ok, "result tag %q not found", cl.ResultTag)
+				require.Equal(t, tt.defaultCategory, resultTag)
+			}
+		})
+	}
 }
-*/
 
-/*
-// Check that the plugin shuts down smoothly, both with and without
-// aggregation in play.  We should be able to see some logging output
-// that indicates certain code paths have been executed.
-func TestStopPlugin(t *testing.T) {
-	NotImplemented(t, "pending some thought")
-}
-*/
-
-// To keep the test execution time within sensible limits, we use a small
-// aggregation_period for all aggregation testing.  That said, to allow
-// cutting down even further, all aggregation tests will be skipped in
-// short-test mode.
-
-// Test essential operation of an aggregation summary.  Also test varying
-// the set of output fields listed in the aggregation_summary_fields option.
+// TestAggregationSummary verifies basic summary aggregation: counters are
+// emitted at the end of a period and the metric has the expected shape.
 func TestAggregationSummary(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping aggregation test in short mode")
@@ -893,7 +490,7 @@ func TestAggregationSummary(t *testing.T) {
 		MatchField:      "message",
 		DropCategories:  []string{"ignore", "unknown"},
 		ResultTag:       "severity",
-		MappedSelectorRegexes: map[string][]map[string]interface{}{
+		MappedSelectorRegexes: map[string][]map[string]any{
 			"database": {
 				{"ignore": "IGNORE"},
 				{"okay": "OK"},
@@ -902,7 +499,7 @@ func TestAggregationSummary(t *testing.T) {
 				{"unknown": ".*"},
 			},
 		},
-		AggregationPeriod:       "5s",
+		AggregationPeriod:       config.Duration(5 * time.Second),
 		AggregationMeasurement:  "status",
 		AggregationDroppedField: "dropped",
 		AggregationTotalField:   "total",
@@ -912,76 +509,43 @@ func TestAggregationSummary(t *testing.T) {
 			"ignore", "okay", "warning", "critical", "unknown", "dropped", "total",
 		},
 	}
-	if testing.Verbose() {
-		cl.logger = &testutil.Logger{}
-	}
+	cl.Log = testLogger()
 
-	now := time.Now()
-	m := metric.New("datapoint", map[string]string{
-		"host": "pg123",
-	}, map[string]interface{}{
-		"message": "nothing to see here, move along",
-	}, now)
-	metrics := make([]telegraf.Metric, 1)
-	metrics[0] = m
+	m := metric.New("datapoint",
+		map[string]string{"host": "pg123"},
+		map[string]any{"message": "nothing to see here, move along"},
+		time.Now())
 
-	// Our configured aggregation_period is one minute, so if this code
-	// does not either wait for that interval to expire or force the
-	// aggregation thread to shut down early and flush its data, we
-	// will only get back the input data point, not the aggregation-data
-	// metric as well.
-	waitDuration, err := time.ParseDuration("10s")
-	require.NoError(t, err)
-	acc, err := RunClassifyTest(t, cl, metrics, waitDuration)
-	require.NoError(t, err)
+	acc := runClassifyTest(t, cl, []telegraf.Metric{m}, 10*time.Second)
 
-	// The original input data point should be dropped.
-	// What we get back instead should be just the summary metric.
-	//
-	// For error reporting, if we have any, we dump out all the accumulator
-	// items one by one on separate lines into a more descriptive error
-	// message, not all in one run-on sentence that is hard to read.
-	//
 	allMetrics := acc.GetTelegrafMetrics()
-	errMsg := "output metrics are:\n"
-	for _, outputMetric := range allMetrics {
-		errMsg += fmt.Sprintf("%v\n", outputMetric)
-	}
-	require.Equal(t, 1, len(allMetrics), errMsg)
+	errMsg := metricsErrMsg(allMetrics)
+	require.Len(t, allMetrics, 1, errMsg)
 
-	// At this point, we should have (except for a different timestamp value, of course):
-	// status map[summary:full] map[dropped:1 total:1 unknown:1] 1655615640000241981
-	processedMetric := allMetrics[0]
+	got := allMetrics[0]
+	require.Equal(t, "status", got.Name(), errMsg)
+	require.Lenf(t, got.TagList(), 1, "tag count; %s", errMsg)
+	require.Lenf(t, got.FieldList(), 3, "field count; %s", errMsg)
 
-	measurement := processedMetric.Name()
-	require.Equal(t, "status", measurement, errMsg)
+	summaryTag, ok := got.GetTag("summary")
+	require.Truef(t, ok, "summary tag missing; %s", errMsg)
+	require.Equal(t, "full", summaryTag, errMsg)
 
-	tagCount := len(processedMetric.TagList())
-	require.EqualValuesf(t, 1, tagCount, "measurement %q has %d tags; %s", measurement, tagCount, errMsg)
-	fieldCount := len(processedMetric.FieldList())
-	require.EqualValuesf(t, 3, fieldCount, "measurement %q has %d fields; %s", measurement, fieldCount, errMsg)
+	dropped, ok := got.GetField("dropped")
+	require.Truef(t, ok, "dropped field missing; %s", errMsg)
+	require.EqualValues(t, 1, dropped, errMsg)
 
-	summaryTag, ok := processedMetric.GetTag("summary")
-	require.Truef(t, ok, "could not find %q tag in the returned metric; %s", "summary", errMsg)
-	require.EqualValuesf(t, "full", summaryTag, "tag %q value was not %q; %s", "summary", "full", errMsg)
+	total, ok := got.GetField("total")
+	require.Truef(t, ok, "total field missing; %s", errMsg)
+	require.EqualValues(t, 1, total, errMsg)
 
-	droppedField, ok := processedMetric.GetField("dropped")
-	require.Truef(t, ok, "could not find %q field in the returned metric; %s", "dropped", errMsg)
-	require.EqualValuesf(t, 1, droppedField, "field %q value was not %q: %s", "dropped", 1, errMsg)
-
-	totalField, ok := processedMetric.GetField("total")
-	require.Truef(t, ok, "could not find %q field in the returned metric; %s", "total", errMsg)
-	require.EqualValuesf(t, 1, totalField, "field %q value was not %q; %s", "total", 1, errMsg)
-
-	unknownField, ok := processedMetric.GetField("unknown")
-	require.Truef(t, ok, "could not find %q field in the returned metric; %s", "unknown", errMsg)
-	require.EqualValuesf(t, 1, unknownField, "field %q value was not %q; %s", "unknown", 1, errMsg)
+	unknown, ok := got.GetField("unknown")
+	require.Truef(t, ok, "unknown field missing; %s", errMsg)
+	require.EqualValues(t, 1, unknown, errMsg)
 }
 
-// Make sure that aggregation counters get cleared when an aggregation period
-// expires.  Also test the clock phase of the reported timestamps, to see if
-// we can get an implementation that syncs up with "natural" boundaries given
-// whatever aggregation_period you have specified.
+// TestAggregationSummaryCycles verifies that counters reset between periods
+// and that two successive periods produce independent metrics.
 func TestAggregationSummaryCycles(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping aggregation test in short mode")
@@ -993,7 +557,7 @@ func TestAggregationSummaryCycles(t *testing.T) {
 		MatchField:      "message",
 		DropCategories:  []string{"ignore", "unknown"},
 		ResultTag:       "severity",
-		MappedSelectorRegexes: map[string][]map[string]interface{}{
+		MappedSelectorRegexes: map[string][]map[string]any{
 			"database": {
 				{"ignore": "IGNORE"},
 				{"okay": "OK"},
@@ -1002,7 +566,7 @@ func TestAggregationSummaryCycles(t *testing.T) {
 				{"unknown": ".*"},
 			},
 		},
-		AggregationPeriod:       "5s",
+		AggregationPeriod:       config.Duration(5 * time.Second),
 		AggregationMeasurement:  "status",
 		AggregationDroppedField: "dropped",
 		AggregationTotalField:   "total",
@@ -1012,151 +576,74 @@ func TestAggregationSummaryCycles(t *testing.T) {
 			"ignore", "okay", "warning", "critical", "unknown", "dropped", "total",
 		},
 	}
-	if testing.Verbose() {
-		cl.logger = &testutil.Logger{}
-	}
+	cl.Log = testLogger()
 
-	now := time.Now()
-	m1 := metric.New("datapoint", map[string]string{
-		"host": "pg123",
-	}, map[string]interface{}{
-		"message": "nothing to see here, move along",
-	}, now)
-
-	now = time.Now()
-	m2 := metric.New("datapoint", map[string]string{
-		"host": "pg123",
-	}, map[string]interface{}{
-		"message": "CRITICAL:  second message from the same host",
-	}, now)
-
-	// Our configured aggregation_period is one minute, so if this code
-	// does not either wait for that interval to expire or force the
-	// aggregation thread to shut down early and flush its data, we
-	// will only get back the input data point, not the aggregation-data
-	// metric as well.
-	waitDuration, err := time.ParseDuration("7s")
-	require.NoError(t, err)
+	m1 := metric.New("datapoint",
+		map[string]string{"host": "pg123"},
+		map[string]any{"message": "nothing to see here, move along"},
+		time.Now())
+	m2 := metric.New("datapoint",
+		map[string]string{"host": "pg123"},
+		map[string]any{"message": "CRITICAL:  second message from the same host"},
+		time.Now())
 
 	acc := &testutil.Accumulator{}
-	err = cl.Reset()
-	require.NoError(t, err, "the Classify object could not be reset")
-	err = cl.Start(acc)
-	require.NoError(t, err, "the classify plugin could not be started")
+	require.NoError(t, cl.Init())
+	require.NoError(t, cl.Start(acc))
 
-	err = cl.Add(m1, acc)
-	require.NoError(t, err, "a metric could not be added to the accumulator")
+	require.NoError(t, cl.Add(m1, acc))
+	time.Sleep(7 * time.Second)
+	require.NoError(t, cl.Add(m2, acc))
+	cl.Stop()
 
-	time.Sleep(waitDuration)
-
-	err = cl.Add(m2, acc)
-	require.NoError(t, err, "a metric could not be added to the accumulator")
-
-	// The cl.Stop() call should shut down the aggregation thread and
-	// effectively flush all the pending aggregation counters to an
-	// output metric, before the current aggregation_period has expired.
-
-	err = cl.Stop()
-	require.NoError(t, err, "the classify plugin could not be stopped")
-
-	// One of the original input data points should have been dropped.  What
-	// we get back instead for that data point should be just the summary line.
-	//
-	// The other input data point should be classified as expected.
-	//
-	// The overall effect is that we should end up with 3 output points,
-	// 1 original and 2 summary.
-	//
-	// For error reporting, if we have any, we dump out all the accumulator
-	// items one by one on separate lines into a more descriptive error
-	// message, not all in one run-on sentence that is hard to read.
-	//
 	allMetrics := acc.GetTelegrafMetrics()
-	errMsg := "output metrics are:\n"
-	for _, outputMetric := range allMetrics {
-		errMsg += fmt.Sprintf("%v\n", outputMetric)
-	}
-	require.Equal(t, 3, len(allMetrics), errMsg)
+	errMsg := metricsErrMsg(allMetrics)
+	require.Len(t, allMetrics, 3, errMsg)
 
-	// At this point, we should have (except for different timestamp values, of course):
-	// status map[summary:full] map[dropped:1 total:1 unknown:1] 1655617150000240511
-	// datapoint map[host:pg123 severity:critical] map[message:CRITICAL:  second message from the same host] 1655617149411068742
-	// status map[summary:full] map[critical:1 total:1] 1655617156413777891
+	// First metric: summary for first period (m1 dropped as unknown).
+	got := allMetrics[0]
+	require.Equal(t, "status", got.Name(), errMsg)
+	require.Lenf(t, got.TagList(), 1, "tag count; %s", errMsg)
+	require.Lenf(t, got.FieldList(), 3, "field count; %s", errMsg)
+	summaryTag, ok := got.GetTag("summary")
+	require.Truef(t, ok, "summary tag missing; %s", errMsg)
+	require.Equal(t, "full", summaryTag, errMsg)
+	dropped, ok := got.GetField("dropped")
+	require.Truef(t, ok, "dropped missing; %s", errMsg)
+	require.EqualValues(t, 1, dropped, errMsg)
+	total, ok := got.GetField("total")
+	require.Truef(t, ok, "total missing; %s", errMsg)
+	require.EqualValues(t, 1, total, errMsg)
 
-	processedMetric := allMetrics[0]
+	// Second metric: m2 passed through as "critical".
+	got = allMetrics[1]
+	require.Equal(t, "datapoint", got.Name(), errMsg)
+	require.Lenf(t, got.TagList(), 2, "tag count; %s", errMsg)
+	require.Lenf(t, got.FieldList(), 1, "field count; %s", errMsg)
+	hostTag, ok := got.GetTag("host")
+	require.Truef(t, ok, "host tag missing; %s", errMsg)
+	require.Equal(t, "pg123", hostTag, errMsg)
+	resultTag, ok := got.GetTag("severity")
+	require.Truef(t, ok, "severity tag missing; %s", errMsg)
+	require.Equal(t, "critical", resultTag, errMsg)
 
-	measurement := processedMetric.Name()
-	require.Equal(t, "status", measurement, errMsg)
-
-	tagCount := len(processedMetric.TagList())
-	require.EqualValuesf(t, 1, tagCount, "measurement %q has %d tags; %s", measurement, tagCount, errMsg)
-	fieldCount := len(processedMetric.FieldList())
-	require.EqualValuesf(t, 3, fieldCount, "measurement %q has %d fields; %s", measurement, fieldCount, errMsg)
-
-	summaryTag, ok := processedMetric.GetTag("summary")
-	require.Truef(t, ok, "could not find %q tag in the returned metric; %s", "summary", errMsg)
-	require.EqualValuesf(t, "full", summaryTag, "tag %q value was not %q; %s", "summary", "full", errMsg)
-
-	droppedField, ok := processedMetric.GetField("dropped")
-	require.Truef(t, ok, "could not find %q field in the returned metric; %s", "dropped", errMsg)
-	require.EqualValuesf(t, 1, droppedField, "field %q value was not %q: %s", "dropped", 1, errMsg)
-
-	totalField, ok := processedMetric.GetField("total")
-	require.Truef(t, ok, "could not find %q field in the returned metric; %s", "total", errMsg)
-	require.EqualValuesf(t, 1, totalField, "field %q value was not %q; %s", "total", 1, errMsg)
-
-	unknownField, ok := processedMetric.GetField("unknown")
-	require.Truef(t, ok, "could not find %q field in the returned metric; %s", "unknown", errMsg)
-	require.EqualValuesf(t, 1, unknownField, "field %q value was not %q; %s", "unknown", 1, errMsg)
-
-	processedMetric = allMetrics[1]
-
-	measurement = processedMetric.Name()
-	require.Equal(t, "datapoint", measurement, errMsg)
-
-	tagCount = len(processedMetric.TagList())
-	require.EqualValuesf(t, 2, tagCount, "measurement %q has %d tags; %s", measurement, tagCount, errMsg)
-	fieldCount = len(processedMetric.FieldList())
-	require.EqualValuesf(t, 1, fieldCount, "measurement %q has %d fields; %s", measurement, fieldCount, errMsg)
-
-	hostTag, ok := processedMetric.GetTag("host")
-	require.Truef(t, ok, "could not find %q tag in the returned metric; %s", "host", errMsg)
-	require.EqualValuesf(t, "pg123", hostTag, "tag %q value was not %q; %s", "host", "pg123", errMsg)
-
-	resultTag, ok := processedMetric.GetTag(cl.ResultTag)
-	require.Truef(t, ok, "could not find %q tag in the returned metric; %s", cl.ResultTag, errMsg)
-	require.EqualValuesf(t, "critical", resultTag, "tag %q value was not %q; %s", cl.ResultTag, "critical", errMsg)
-
-	matchField, ok := processedMetric.GetField(cl.MatchField)
-	require.Truef(t, ok, "could not find %q field in the returned metric; %s", cl.MatchField, errMsg)
-	require.EqualValuesf(t, "CRITICAL:  second message from the same host", matchField, "field %q value was not %q; %s",
-		cl.MatchField, "CRITICAL:  second message from the same host", errMsg)
-
-	processedMetric = allMetrics[2]
-
-	measurement = processedMetric.Name()
-	require.Equal(t, "status", measurement, errMsg)
-
-	tagCount = len(processedMetric.TagList())
-	require.EqualValuesf(t, 1, tagCount, "measurement %q has %d tags; %s", measurement, tagCount, errMsg)
-	fieldCount = len(processedMetric.FieldList())
-	require.EqualValuesf(t, 2, fieldCount, "measurement %q has %d fields; %s", measurement, fieldCount, errMsg)
-
-	summaryTag, ok = processedMetric.GetTag("summary")
-	require.Truef(t, ok, "could not find %q tag in the returned metric; %s", "summary", errMsg)
-	require.EqualValuesf(t, "full", summaryTag, "tag %q value was not %q; %s", "summary", "full", errMsg)
-
-	criticalField, ok := processedMetric.GetField("critical")
-	require.Truef(t, ok, "could not find %q field in the returned metric; %s", "critical", errMsg)
-	require.EqualValuesf(t, 1, criticalField, "field %q value was not %q: %s", "critical", 1, errMsg)
-
-	totalField, ok = processedMetric.GetField("total")
-	require.Truef(t, ok, "could not find %q field in the returned metric; %s", "total", errMsg)
-	require.EqualValuesf(t, 1, totalField, "field %q value was not %q; %s", "total", 1, errMsg)
+	// Third metric: summary for second period (m2 classified as critical).
+	got = allMetrics[2]
+	require.Equal(t, "status", got.Name(), errMsg)
+	require.Lenf(t, got.TagList(), 1, "tag count; %s", errMsg)
+	require.Lenf(t, got.FieldList(), 2, "field count; %s", errMsg)
+	summaryTag, ok = got.GetTag("summary")
+	require.Truef(t, ok, "summary tag missing; %s", errMsg)
+	require.Equal(t, "full", summaryTag, errMsg)
+	critical, ok := got.GetField("critical")
+	require.Truef(t, ok, "critical field missing; %s", errMsg)
+	require.EqualValues(t, 1, critical, errMsg)
+	total, ok = got.GetField("total")
+	require.Truef(t, ok, "total missing; %s", errMsg)
+	require.EqualValues(t, 1, total, errMsg)
 }
 
-// Test essential operation of aggregating statistics by regex group.  Vary
-// the set of output fields listed in the aggregation_group_fields option.
+// TestAggregationByGroup verifies per-regex-group aggregation counters.
 func TestAggregationByGroup(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping aggregation test in short mode")
@@ -1171,7 +658,7 @@ func TestAggregationByGroup(t *testing.T) {
 		MatchField:     "message",
 		DropCategories: []string{"ignore", "unknown"},
 		ResultTag:      "severity",
-		MappedSelectorRegexes: map[string][]map[string]interface{}{
+		MappedSelectorRegexes: map[string][]map[string]any{
 			"database": {
 				{"ignore": "IGNORE"},
 				{"okay": "OK"},
@@ -1187,7 +674,7 @@ func TestAggregationByGroup(t *testing.T) {
 				{"unknown": ".*"},
 			},
 		},
-		AggregationPeriod:       "5s",
+		AggregationPeriod:       config.Duration(5 * time.Second),
 		AggregationMeasurement:  "status",
 		AggregationDroppedField: "dropped",
 		AggregationTotalField:   "total",
@@ -1196,157 +683,87 @@ func TestAggregationByGroup(t *testing.T) {
 			"ignore", "okay", "warning", "critical", "unknown", "dropped", "total",
 		},
 	}
-	if testing.Verbose() {
-		cl.logger = &testutil.Logger{}
-	}
+	cl.Log = testLogger()
 
 	now := time.Now()
-	m0 := metric.New("datapoint", map[string]string{
-		"host": "pg123",
-	}, map[string]interface{}{
-		"message": "WARNING:  situation is crazy",
-	}, now)
-	m1 := metric.New("datapoint", map[string]string{
-		"host": "pg124",
-	}, map[string]interface{}{
-		"message": "nothing to see here, move along",
-	}, now)
-	m2 := metric.New("datapoint", map[string]string{
-		"host": "fire567",
-	}, map[string]interface{}{
-		"message": "INTRUSION:  assets at risk",
-	}, now)
-	metrics := make([]telegraf.Metric, 3)
-	metrics[0] = m0
-	metrics[1] = m1
-	metrics[2] = m2
-
-	// Our configured aggregation_period is one minute, so if this code
-	// does not either wait for that interval to expire or force the
-	// aggregation thread to shut down early and flush its data, we
-	// will only get back the input data point, not the aggregation-data
-	// metric as well.
-	waitDuration, err := time.ParseDuration("10s")
-	require.NoError(t, err)
-	acc, err := RunClassifyTest(t, cl, metrics, waitDuration)
-	require.NoError(t, err)
-
-	// The original input data point should be dropped.
-	// What we get back instead should be just the summary metric.
-	//
-	// For error reporting, if we have any, we dump out all the accumulator
-	// items one by one on separate lines into a more descriptive error
-	// message, not all in one run-on sentence that is hard to read.
-	//
-	allMetrics := acc.GetTelegrafMetrics()
-	errMsg := "output metrics are:\n"
-	for _, outputMetric := range allMetrics {
-		errMsg += fmt.Sprintf("%v\n", outputMetric)
+	metrics := []telegraf.Metric{
+		metric.New("datapoint",
+			map[string]string{"host": "pg123"},
+			map[string]any{"message": "WARNING:  situation is crazy"},
+			now),
+		metric.New("datapoint",
+			map[string]string{"host": "pg124"},
+			map[string]any{"message": "nothing to see here, move along"},
+			now),
+		metric.New("datapoint",
+			map[string]string{"host": "fire567"},
+			map[string]any{"message": "INTRUSION:  assets at risk"},
+			now),
 	}
-	require.Equal(t, 4, len(allMetrics), errMsg)
 
-	// At this point, we should have (except for different timestamp values, of course):
-	// datapoint map[host:pg123 severity:warning] map[message:WARNING:  situation is crazy] 1655659203578691212
-	// datapoint map[host:fire567 severity:critical] map[message:INTRUSION:  assets at risk] 1655659203578691212
-	// status map[by_machine_type:database] map[dropped:1 total:2 unknown:1 warning:1] 1655659205001563076
-	// status map[by_machine_type:firewall] map[critical:1 total:1] 1655659205001563076
+	acc := runClassifyTest(t, cl, metrics, 10*time.Second)
 
-	// The input-data items may appear in either order, so we have to deal with that in the logic here.
+	allMetrics := acc.GetTelegrafMetrics()
+	errMsg := metricsErrMsg(allMetrics)
+	require.Len(t, allMetrics, 4, errMsg)
+
+	// First two are passthrough datapoints (order may vary).
 	distinctSelector := make(map[string]int)
-	for index := 0; index <= 1; index++ {
-		processedMetric := allMetrics[index]
+	for i := 0; i <= 1; i++ {
+		got := allMetrics[i]
+		require.Equal(t, "datapoint", got.Name(), errMsg)
+		require.Lenf(t, got.TagList(), 2, "tag count; %s", errMsg)
 
-		measurement := processedMetric.Name()
-		require.Equal(t, "datapoint", measurement, errMsg)
-
-		tagCount := len(processedMetric.TagList())
-		require.EqualValuesf(t, 2, tagCount, "measurement %q has %d tags; %s", measurement, tagCount, errMsg)
-
-		selectorTag, ok := processedMetric.GetTag(cl.SelectorTag)
-		require.Truef(t, ok, "could not find %q tag in the returned metric; %s", cl.SelectorTag, errMsg)
-
-		resultTag, ok := processedMetric.GetTag(cl.ResultTag)
-		require.Truef(t, ok, "could not find %q tag in the returned metric; %s", cl.ResultTag, errMsg)
-
-		fieldCount := len(processedMetric.FieldList())
-		require.EqualValuesf(t, 1, fieldCount, "measurement %q has %d fields; %s", measurement, fieldCount, errMsg)
-
-		matchField, ok := processedMetric.GetField(cl.MatchField)
-		require.Truef(t, ok, "could not find %q field in the returned metric; %s", cl.MatchField, errMsg)
+		selectorTag, ok := got.GetTag(cl.SelectorTag)
+		require.Truef(t, ok, "host tag missing; %s", errMsg)
+		resultTag, ok := got.GetTag(cl.ResultTag)
+		require.Truef(t, ok, "severity tag missing; %s", errMsg)
 
 		distinctSelector[selectorTag]++
 		switch selectorTag {
 		case "pg123":
-			require.EqualValuesf(t, "warning", resultTag, "tag %q value was not %q; %s", cl.ResultTag, "warning", errMsg)
-			require.EqualValuesf(t, "WARNING:  situation is crazy", matchField, "field %q value was not %q; %s",
-				cl.MatchField, "WARNING:  situation is crazy", errMsg)
+			require.Equal(t, "warning", resultTag, errMsg)
 		case "fire567":
-			require.EqualValuesf(t, "critical", resultTag, "tag %q value was not %q; %s", cl.ResultTag, "critical", errMsg)
-			require.EqualValuesf(t, "INTRUSION:  assets at risk", matchField, "field %q value was not %q; %s",
-				cl.MatchField, "INTRUSION:  assets at risk", errMsg)
+			require.Equal(t, "critical", resultTag, errMsg)
 		default:
-			require.FailNowf(t, "an unexpected selector tag value appears", "%q tag value %q is unexpected; %s",
-				cl.AggregationSelectorTag, selectorTag, errMsg)
+			require.FailNowf(t, "unexpected selector tag value %q", selectorTag)
 		}
 	}
-	require.EqualValuesf(t, 2, len(distinctSelector), "have not seen the expected set of selectors in agggregation data points; %s", errMsg)
+	require.Len(t, distinctSelector, 2, errMsg)
 
-	// The aggregation-data items may appear in either order, so we have to deal with that in the logic here.
+	// Last two are aggregation metrics by group (order may vary).
 	distinctGroup := make(map[string]int)
-	for index := 2; index <= 3; index++ {
-		processedMetric := allMetrics[index]
+	for i := 2; i <= 3; i++ {
+		got := allMetrics[i]
+		require.Equal(t, cl.AggregationMeasurement, got.Name(), errMsg)
+		require.Lenf(t, got.TagList(), 1, "tag count; %s", errMsg)
 
-		measurement := processedMetric.Name()
-		require.Equal(t, cl.AggregationMeasurement, measurement, errMsg)
-
-		tagCount := len(processedMetric.TagList())
-		require.EqualValuesf(t, 1, tagCount, "measurement %q has %d tags; %s", measurement, tagCount, errMsg)
-
-		groupTag, ok := processedMetric.GetTag(cl.AggregationGroupTag)
-		require.Truef(t, ok, "could not find %q tag in the returned metric; %s", cl.AggregationGroupTag, errMsg)
+		groupTag, ok := got.GetTag(cl.AggregationGroupTag)
+		require.Truef(t, ok, "group tag missing; %s", errMsg)
 
 		distinctGroup[groupTag]++
 		switch groupTag {
 		case "database":
-			fieldCount := len(processedMetric.FieldList())
-			require.EqualValuesf(t, 4, fieldCount, "measurement %q selector %q has %d fields; %s", measurement, groupTag, fieldCount, errMsg)
-
-			droppedField, ok := processedMetric.GetField(cl.AggregationDroppedField)
-			require.Truef(t, ok, "could not find %q field in the returned metric; %s", cl.AggregationDroppedField, errMsg)
-			require.EqualValuesf(t, 1, droppedField, "field %q value was not %q: %s", cl.AggregationDroppedField, 1, errMsg)
-
-			totalField, ok := processedMetric.GetField(cl.AggregationTotalField)
-			require.Truef(t, ok, "could not find %q field in the returned metric; %s", cl.AggregationTotalField, errMsg)
-			require.EqualValuesf(t, 2, totalField, "field %q value was not %q; %s", cl.AggregationTotalField, 2, errMsg)
-
-			unknownField, ok := processedMetric.GetField("unknown")
-			require.Truef(t, ok, "could not find %q field in the returned metric; %s", "unknown", errMsg)
-			require.EqualValuesf(t, 1, unknownField, "field %q value was not %q; %s", "unknown", 1, errMsg)
-
-			warningField, ok := processedMetric.GetField("warning")
-			require.Truef(t, ok, "could not find %q field in the returned metric; %s", "warning", errMsg)
-			require.EqualValuesf(t, 1, warningField, "field %q value was not %q; %s", "warning", 1, errMsg)
+			require.Lenf(t, got.FieldList(), 4, "database field count; %s", errMsg)
+			dropped, ok := got.GetField(cl.AggregationDroppedField)
+			require.Truef(t, ok, "dropped missing; %s", errMsg)
+			require.EqualValues(t, 1, dropped, errMsg)
+			total, ok := got.GetField(cl.AggregationTotalField)
+			require.Truef(t, ok, "total missing; %s", errMsg)
+			require.EqualValues(t, 2, total, errMsg)
 		case "firewall":
-			fieldCount := len(processedMetric.FieldList())
-			require.EqualValuesf(t, 2, fieldCount, "measurement %q selector %q has %d fields; %s", measurement, groupTag, fieldCount, errMsg)
-
-			criticalField, ok := processedMetric.GetField("critical")
-			require.Truef(t, ok, "could not find %q field in the returned metric; %s", "critical", errMsg)
-			require.EqualValuesf(t, 1, criticalField, "field %q value was not %q; %s", "critical", 1, errMsg)
-
-			totalField, ok := processedMetric.GetField(cl.AggregationTotalField)
-			require.Truef(t, ok, "could not find %q field in the returned metric; %s", cl.AggregationTotalField, errMsg)
-			require.EqualValuesf(t, 1, totalField, "field %q value was not %q; %s", cl.AggregationTotalField, 1, errMsg)
+			require.Lenf(t, got.FieldList(), 2, "firewall field count; %s", errMsg)
+			critical, ok := got.GetField("critical")
+			require.Truef(t, ok, "critical missing; %s", errMsg)
+			require.EqualValues(t, 1, critical, errMsg)
 		default:
-			require.FailNowf(t, "an unexpected group tag value appears", "%q tag value %q is unexpected; %s",
-				cl.AggregationGroupTag, groupTag, errMsg)
+			require.FailNowf(t, "unexpected group tag value %q", groupTag)
 		}
 	}
-	require.EqualValuesf(t, 2, len(distinctGroup), "have not seen the expected set of groups in agggregation data points; %s", errMsg)
+	require.Len(t, distinctGroup, 2, errMsg)
 }
 
-// Test essential operation of aggregating statistics by selector value.  Vary
-// the set of output fields listed in the aggregation_selector_fields option.
+// TestAggregationBySelector verifies per-selector aggregation counters.
 func TestAggregationBySelector(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping aggregation test in short mode")
@@ -1358,7 +775,7 @@ func TestAggregationBySelector(t *testing.T) {
 		MatchField:      "message",
 		DropCategories:  []string{"ignore", "unknown"},
 		ResultTag:       "severity",
-		MappedSelectorRegexes: map[string][]map[string]interface{}{
+		MappedSelectorRegexes: map[string][]map[string]any{
 			"database": {
 				{"ignore": "IGNORE"},
 				{"okay": "OK"},
@@ -1367,7 +784,7 @@ func TestAggregationBySelector(t *testing.T) {
 				{"unknown": ".*"},
 			},
 		},
-		AggregationPeriod:       "5s",
+		AggregationPeriod:       config.Duration(5 * time.Second),
 		AggregationMeasurement:  "status",
 		AggregationDroppedField: "dropped",
 		AggregationTotalField:   "total",
@@ -1376,144 +793,74 @@ func TestAggregationBySelector(t *testing.T) {
 			"ignore", "okay", "warning", "critical", "unknown", "dropped", "total",
 		},
 	}
-	if testing.Verbose() {
-		cl.logger = &testutil.Logger{}
-	}
+	cl.Log = testLogger()
 
 	now := time.Now()
-	m0 := metric.New("datapoint", map[string]string{
-		"host": "pg123",
-	}, map[string]interface{}{
-		"message": "WARNING:  situation is crazy",
-	}, now)
-	m1 := metric.New("datapoint", map[string]string{
-		"host": "pg123",
-	}, map[string]interface{}{
-		"message": "nothing to see here, move along",
-	}, now)
-	m2 := metric.New("datapoint", map[string]string{
-		"host": "pg124",
-	}, map[string]interface{}{
-		"message": "nothing to see here, move along",
-	}, now)
-	metrics := make([]telegraf.Metric, 3)
-	metrics[0] = m0
-	metrics[1] = m1
-	metrics[2] = m2
-
-	// Our configured aggregation_period is one minute, so if this code
-	// does not either wait for that interval to expire or force the
-	// aggregation thread to shut down early and flush its data, we
-	// will only get back the input data point, not the aggregation-data
-	// metric as well.
-	waitDuration, err := time.ParseDuration("10s")
-	require.NoError(t, err)
-	acc, err := RunClassifyTest(t, cl, metrics, waitDuration)
-	require.NoError(t, err)
-
-	// The original input data point should be dropped.
-	// What we get back instead should be just the summary metric.
-	//
-	// For error reporting, if we have any, we dump out all the accumulator
-	// items one by one on separate lines into a more descriptive error
-	// message, not all in one run-on sentence that is hard to read.
-	//
-	allMetrics := acc.GetTelegrafMetrics()
-	errMsg := "output metrics are:\n"
-	for _, outputMetric := range allMetrics {
-		errMsg += fmt.Sprintf("%v\n", outputMetric)
+	metrics := []telegraf.Metric{
+		metric.New("datapoint",
+			map[string]string{"host": "pg123"},
+			map[string]any{"message": "WARNING:  situation is crazy"},
+			now),
+		metric.New("datapoint",
+			map[string]string{"host": "pg123"},
+			map[string]any{"message": "nothing to see here, move along"},
+			now),
+		metric.New("datapoint",
+			map[string]string{"host": "pg124"},
+			map[string]any{"message": "nothing to see here, move along"},
+			now),
 	}
-	require.Equal(t, 3, len(allMetrics), errMsg)
 
-	// At this point, we should have (except for different timestamp values, of course):
-	// datapoint map[host:pg123 severity:warning] map[message:WARNING:  situation is crazy] 1655627120351552490
-	// status map[by_host:pg123] map[dropped:1 total:2 unknown:1 warning:1] 1655627125003105632
-	// status map[by_host:pg124] map[dropped:1 total:1 unknown:1] 1655627125003105632
+	acc := runClassifyTest(t, cl, metrics, 10*time.Second)
 
-	processedMetric := allMetrics[0]
+	allMetrics := acc.GetTelegrafMetrics()
+	errMsg := metricsErrMsg(allMetrics)
+	require.Len(t, allMetrics, 3, errMsg)
 
-	measurement := processedMetric.Name()
-	require.Equal(t, "datapoint", measurement, errMsg)
+	// First is the passthrough datapoint.
+	got := allMetrics[0]
+	require.Equal(t, "datapoint", got.Name(), errMsg)
+	selectorTag, ok := got.GetTag(cl.SelectorTag)
+	require.Truef(t, ok, "host tag missing; %s", errMsg)
+	require.Equal(t, "pg123", selectorTag, errMsg)
+	resultTag, ok := got.GetTag(cl.ResultTag)
+	require.Truef(t, ok, "severity tag missing; %s", errMsg)
+	require.Equal(t, "warning", resultTag, errMsg)
 
-	tagCount := len(processedMetric.TagList())
-	require.EqualValuesf(t, 2, tagCount, "measurement %q has %d tags; %s", measurement, tagCount, errMsg)
-	fieldCount := len(processedMetric.FieldList())
-	require.EqualValuesf(t, 1, fieldCount, "measurement %q has %d fields; %s", measurement, fieldCount, errMsg)
-
-	selectorTag, ok := processedMetric.GetTag(cl.SelectorTag)
-	require.Truef(t, ok, "could not find %q tag in the returned metric; %s", cl.SelectorTag, errMsg)
-	require.EqualValuesf(t, "pg123", selectorTag, "tag %q value was not %q; %s", cl.SelectorTag, "pg123", errMsg)
-
-	resultTag, ok := processedMetric.GetTag(cl.ResultTag)
-	require.Truef(t, ok, "could not find %q tag in the returned metric; %s", cl.ResultTag, errMsg)
-	require.EqualValuesf(t, "warning", resultTag, "tag %q value was not %q; %s", cl.ResultTag, "warning", errMsg)
-
-	matchField, ok := processedMetric.GetField(cl.MatchField)
-	require.Truef(t, ok, "could not find %q field in the returned metric; %s", cl.MatchField, errMsg)
-	require.EqualValuesf(t, "WARNING:  situation is crazy", matchField, "field %q value was not %q; %s",
-		cl.MatchField, "WARNING:  situation is crazy", errMsg)
-
-	// The aggregation-data items may appear in either order, so we have to deal with that in the logic here.
+	// Remaining two are per-selector aggregation metrics (order may vary).
 	distinctSelector := make(map[string]int)
-	for index := 1; index <= 2; index++ {
-		processedMetric = allMetrics[index]
+	for i := 1; i <= 2; i++ {
+		got = allMetrics[i]
+		require.Equal(t, cl.AggregationMeasurement, got.Name(), errMsg)
+		require.Lenf(t, got.TagList(), 1, "tag count; %s", errMsg)
 
-		measurement = processedMetric.Name()
-		require.Equal(t, cl.AggregationMeasurement, measurement, errMsg)
+		sel, ok := got.GetTag(cl.AggregationSelectorTag)
+		require.Truef(t, ok, "selector tag missing; %s", errMsg)
+		distinctSelector[sel]++
 
-		tagCount = len(processedMetric.TagList())
-		require.EqualValuesf(t, 1, tagCount, "measurement %q has %d tags; %s", measurement, tagCount, errMsg)
-
-		selectorTag, ok := processedMetric.GetTag(cl.AggregationSelectorTag)
-		require.Truef(t, ok, "could not find %q tag in the returned metric; %s", cl.AggregationSelectorTag, errMsg)
-
-		distinctSelector[selectorTag]++
-		switch selectorTag {
+		switch sel {
 		case "pg123":
-			fieldCount = len(processedMetric.FieldList())
-			require.EqualValuesf(t, 4, fieldCount, "measurement %q selector %q has %d fields; %s", measurement, selectorTag, fieldCount, errMsg)
-
-			droppedField, ok := processedMetric.GetField(cl.AggregationDroppedField)
-			require.Truef(t, ok, "could not find %q field in the returned metric; %s", cl.AggregationDroppedField, errMsg)
-			require.EqualValuesf(t, 1, droppedField, "field %q value was not %q: %s", cl.AggregationDroppedField, 1, errMsg)
-
-			totalField, ok := processedMetric.GetField(cl.AggregationTotalField)
-			require.Truef(t, ok, "could not find %q field in the returned metric; %s", cl.AggregationTotalField, errMsg)
-			require.EqualValuesf(t, 2, totalField, "field %q value was not %q; %s", cl.AggregationTotalField, 2, errMsg)
-
-			unknownField, ok := processedMetric.GetField("unknown")
-			require.Truef(t, ok, "could not find %q field in the returned metric; %s", "unknown", errMsg)
-			require.EqualValuesf(t, 1, unknownField, "field %q value was not %q; %s", "unknown", 1, errMsg)
-
-			warningField, ok := processedMetric.GetField("warning")
-			require.Truef(t, ok, "could not find %q field in the returned metric; %s", "warning", errMsg)
-			require.EqualValuesf(t, 1, warningField, "field %q value was not %q; %s", "warning", 1, errMsg)
+			require.Lenf(t, got.FieldList(), 4, "pg123 field count; %s", errMsg)
+			dropped, ok := got.GetField(cl.AggregationDroppedField)
+			require.Truef(t, ok, "dropped missing; %s", errMsg)
+			require.EqualValues(t, 1, dropped, errMsg)
+			total, ok := got.GetField(cl.AggregationTotalField)
+			require.Truef(t, ok, "total missing; %s", errMsg)
+			require.EqualValues(t, 2, total, errMsg)
 		case "pg124":
-			fieldCount = len(processedMetric.FieldList())
-			require.EqualValuesf(t, 3, fieldCount, "measurement %q selector %q has %d fields; %s", measurement, selectorTag, fieldCount, errMsg)
-
-			droppedField, ok := processedMetric.GetField(cl.AggregationDroppedField)
-			require.Truef(t, ok, "could not find %q field in the returned metric; %s", cl.AggregationDroppedField, errMsg)
-			require.EqualValuesf(t, 1, droppedField, "field %q value was not %q: %s", cl.AggregationDroppedField, 1, errMsg)
-
-			totalField, ok := processedMetric.GetField(cl.AggregationTotalField)
-			require.Truef(t, ok, "could not find %q field in the returned metric; %s", cl.AggregationTotalField, errMsg)
-			require.EqualValuesf(t, 1, totalField, "field %q value was not %q; %s", cl.AggregationTotalField, 1, errMsg)
-
-			unknownField, ok := processedMetric.GetField("unknown")
-			require.Truef(t, ok, "could not find %q field in the returned metric; %s", "unknown", errMsg)
-			require.EqualValuesf(t, 1, unknownField, "field %q value was not %q; %s", "unknown", 1, errMsg)
+			require.Lenf(t, got.FieldList(), 3, "pg124 field count; %s", errMsg)
+			dropped, ok := got.GetField(cl.AggregationDroppedField)
+			require.Truef(t, ok, "dropped missing; %s", errMsg)
+			require.EqualValues(t, 1, dropped, errMsg)
 		default:
-			require.FailNowf(t, "an unexpected selector tag value appears", "%q tag value %q is unexpected; %s",
-				cl.AggregationSelectorTag, selectorTag, errMsg)
+			require.FailNowf(t, "unexpected selector tag value %q", sel)
 		}
 	}
-	require.EqualValuesf(t, 2, len(distinctSelector), "have not seen the expected set of selectors in agggregation data points; %s", errMsg)
+	require.Len(t, distinctSelector, 2, errMsg)
 }
 
-// Test the counting of dropped items and the total total number of processed
-// items (whether dropped or not), along with the category names specified by
-// the aggregationDroppedField and aggregationTotalField options.
+// TestAggregationDroppedAndTotalFields verifies that dropped and total counters
+// track the right counts across a mix of passed and dropped metrics.
 func TestAggregationDroppedAndTotalFields(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping aggregation test in short mode")
@@ -1525,7 +872,7 @@ func TestAggregationDroppedAndTotalFields(t *testing.T) {
 		MatchField:      "message",
 		DropCategories:  []string{"ignore", "unknown"},
 		ResultTag:       "severity",
-		MappedSelectorRegexes: map[string][]map[string]interface{}{
+		MappedSelectorRegexes: map[string][]map[string]any{
 			"database": {
 				{"ignore": "IGNORE"},
 				{"okay": "OK"},
@@ -1534,7 +881,7 @@ func TestAggregationDroppedAndTotalFields(t *testing.T) {
 				{"unknown": ".*"},
 			},
 		},
-		AggregationPeriod:       "5s",
+		AggregationPeriod:       config.Duration(5 * time.Second),
 		AggregationMeasurement:  "status",
 		AggregationDroppedField: "dropped",
 		AggregationTotalField:   "total",
@@ -1544,110 +891,431 @@ func TestAggregationDroppedAndTotalFields(t *testing.T) {
 			"ignore", "okay", "warning", "critical", "unknown", "dropped", "total",
 		},
 	}
-	if testing.Verbose() {
-		cl.logger = &testutil.Logger{}
-	}
+	cl.Log = testLogger()
 
 	now := time.Now()
-	m0 := metric.New("datapoint", map[string]string{
-		"host": "pg123",
-	}, map[string]interface{}{
-		"message": "WARNING:  situation is crazy",
-	}, now)
-	m1 := metric.New("datapoint", map[string]string{
-		"host": "pg123",
-	}, map[string]interface{}{
-		"message": "nothing to see here, move along",
-	}, now)
-	m2 := metric.New("datapoint", map[string]string{
-		"host": "pg123",
-	}, map[string]interface{}{
-		"message": "nothing to see here, move along",
-	}, now)
-	metrics := make([]telegraf.Metric, 3)
-	metrics[0] = m0
-	metrics[1] = m1
-	metrics[2] = m2
-
-	// Our configured aggregation_period is one minute, so if this code
-	// does not either wait for that interval to expire or force the
-	// aggregation thread to shut down early and flush its data, we
-	// will only get back the input data point, not the aggregation-data
-	// metric as well.
-	waitDuration, err := time.ParseDuration("10s")
-	require.NoError(t, err)
-	acc, err := RunClassifyTest(t, cl, metrics, waitDuration)
-	require.NoError(t, err)
-
-	// The original input data point should be dropped.
-	// What we get back instead should be just the summary metric.
-	//
-	// For error reporting, if we have any, we dump out all the accumulator
-	// items one by one on separate lines into a more descriptive error
-	// message, not all in one run-on sentence that is hard to read.
-	//
-	allMetrics := acc.GetTelegrafMetrics()
-	errMsg := "output metrics are:\n"
-	for _, outputMetric := range allMetrics {
-		errMsg += fmt.Sprintf("%v\n", outputMetric)
+	metrics := []telegraf.Metric{
+		metric.New("datapoint",
+			map[string]string{"host": "pg123"},
+			map[string]any{"message": "WARNING:  situation is crazy"},
+			now),
+		metric.New("datapoint",
+			map[string]string{"host": "pg123"},
+			map[string]any{"message": "nothing to see here, move along"},
+			now),
+		metric.New("datapoint",
+			map[string]string{"host": "pg123"},
+			map[string]any{"message": "nothing to see here, move along"},
+			now),
 	}
-	require.Equal(t, 2, len(allMetrics), errMsg)
 
-	// At this point, we should have (except for different timestamp values, of course):
-	// datapoint map[host:pg123 severity:warning] map[message:WARNING:  situation is crazy] 1655624937598389523
-	// status map[summary:full] map[dropped:2 total:3 unknown:2 warning:1] 1655624940002217562
+	acc := runClassifyTest(t, cl, metrics, 10*time.Second)
 
-	processedMetric := allMetrics[0]
+	allMetrics := acc.GetTelegrafMetrics()
+	errMsg := metricsErrMsg(allMetrics)
+	require.Len(t, allMetrics, 2, errMsg)
 
-	measurement := processedMetric.Name()
-	require.Equal(t, "datapoint", measurement, errMsg)
+	// First: the passed-through warning metric.
+	got := allMetrics[0]
+	require.Equal(t, "datapoint", got.Name(), errMsg)
+	require.Lenf(t, got.TagList(), 2, "tag count; %s", errMsg)
+	require.Lenf(t, got.FieldList(), 1, "field count; %s", errMsg)
+	resultTag, ok := got.GetTag(cl.ResultTag)
+	require.Truef(t, ok, "severity tag missing; %s", errMsg)
+	require.Equal(t, "warning", resultTag, errMsg)
 
-	tagCount := len(processedMetric.TagList())
-	require.EqualValuesf(t, 2, tagCount, "measurement %q has %d tags; %s", measurement, tagCount, errMsg)
-	fieldCount := len(processedMetric.FieldList())
-	require.EqualValuesf(t, 1, fieldCount, "measurement %q has %d fields; %s", measurement, fieldCount, errMsg)
+	// Second: the summary aggregation metric.
+	got = allMetrics[1]
+	require.Equal(t, cl.AggregationMeasurement, got.Name(), errMsg)
+	require.Lenf(t, got.TagList(), 1, "tag count; %s", errMsg)
+	require.Lenf(t, got.FieldList(), 4, "field count; %s", errMsg)
 
-	selectorTag, ok := processedMetric.GetTag(cl.SelectorTag)
-	require.Truef(t, ok, "could not find %q tag in the returned metric; %s", cl.SelectorTag, errMsg)
-	require.EqualValuesf(t, "pg123", selectorTag, "tag %q value was not %q; %s", cl.SelectorTag, "pg123", errMsg)
+	summaryTag, ok := got.GetTag(cl.AggregationSummaryTag)
+	require.Truef(t, ok, "summary tag missing; %s", errMsg)
+	require.Equal(t, cl.AggregationSummaryValue, summaryTag, errMsg)
 
-	resultTag, ok := processedMetric.GetTag(cl.ResultTag)
-	require.Truef(t, ok, "could not find %q tag in the returned metric; %s", cl.ResultTag, errMsg)
-	require.EqualValuesf(t, "warning", resultTag, "tag %q value was not %q; %s", cl.ResultTag, "warning", errMsg)
+	dropped, ok := got.GetField(cl.AggregationDroppedField)
+	require.Truef(t, ok, "dropped missing; %s", errMsg)
+	require.EqualValues(t, 2, dropped, errMsg)
 
-	matchField, ok := processedMetric.GetField(cl.MatchField)
-	require.Truef(t, ok, "could not find %q field in the returned metric; %s", cl.MatchField, errMsg)
-	require.EqualValuesf(t, "WARNING:  situation is crazy", matchField, "field %q value was not %q; %s",
-		cl.MatchField, "WARNING:  situation is crazy", errMsg)
+	total, ok := got.GetField(cl.AggregationTotalField)
+	require.Truef(t, ok, "total missing; %s", errMsg)
+	require.EqualValues(t, 3, total, errMsg)
 
-	processedMetric = allMetrics[1]
+	unknown, ok := got.GetField("unknown")
+	require.Truef(t, ok, "unknown missing; %s", errMsg)
+	require.EqualValues(t, 2, unknown, errMsg)
 
-	measurement = processedMetric.Name()
-	require.Equal(t, cl.AggregationMeasurement, measurement, errMsg)
+	warning, ok := got.GetField("warning")
+	require.Truef(t, ok, "warning missing; %s", errMsg)
+	require.EqualValues(t, 1, warning, errMsg)
+}
 
-	tagCount = len(processedMetric.TagList())
-	require.EqualValuesf(t, 1, tagCount, "measurement %q has %d tags; %s", measurement, tagCount, errMsg)
-	fieldCount = len(processedMetric.FieldList())
-	require.EqualValuesf(t, 4, fieldCount, "measurement %q has %d fields; %s", measurement, fieldCount, errMsg)
+// metricsErrMsg formats all metrics into a readable string for assertion messages.
+func metricsErrMsg(metrics []telegraf.Metric) string {
+	var msg strings.Builder
+	msg.WriteString("output metrics:\n")
+	for _, m := range metrics {
+		fmt.Fprintf(&msg, "  %v\n", m)
+	}
+	return msg.String()
+}
 
-	summaryTag, ok := processedMetric.GetTag(cl.AggregationSummaryTag)
-	require.Truef(t, ok, "could not find %q tag in the returned metric; %s", cl.AggregationSummaryTag, errMsg)
-	require.EqualValuesf(t, cl.AggregationSummaryValue, summaryTag, "tag %q value was not %q; %s",
-		cl.AggregationSummaryTag, cl.AggregationSummaryValue, errMsg)
+// TestDropCategories loads drop_categories through the TOML decoder, as a real
+// configuration file does: a TOML array is decoded as []any, not []string.
+func TestDropCategories(t *testing.T) {
+	const base = `
+selector_tag = "host"
+selector_mapping = [{ "pg\\d{3}" = "database" }]
+match_field = "message"
+result_tag = "severity"
+[mapped_selector_regexes]
+  database = [
+    { ignore = "IGNORE" },
+    { okay = "OKAY" },
+    { warning = "WARNING" },
+  ]
+`
+	tests := []struct {
+		name    string
+		drop    string
+		want    []string // messages that survive
+		wantErr string
+	}{
+		{name: "string", drop: `drop_categories = "ignore"`, want: []string{"OKAY", "WARNING"}},
+		{name: "array", drop: `drop_categories = ["ignore", "warning"]`, want: []string{"OKAY"}},
+		{name: "empty array", drop: `drop_categories = []`, want: []string{"IGNORE", "OKAY", "WARNING"}},
+		{name: "non-string element", drop: `drop_categories = [1, 2]`, wantErr: "must be a string or array of strings"},
+		{name: "not a string or array", drop: `drop_categories = 1`, wantErr: "must be a string or array of strings"},
+		{name: "unknown category", drop: `drop_categories = ["ignore", "bogus"]`, wantErr: `"bogus" in drop_categories`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// top-level keys must precede the [mapped_selector_regexes] table
+			cl := &Classify{Log: testLogger()}
+			require.NoError(t, toml.Unmarshal([]byte(tt.drop+"\n"+base), cl))
+			if tt.wantErr != "" {
+				require.ErrorContains(t, cl.Init(), tt.wantErr)
+				return
+			}
+			messages := []string{"IGNORE", "OKAY", "WARNING"}
+			metrics := make([]telegraf.Metric, 0, len(messages))
+			for _, msg := range messages {
+				metrics = append(metrics, metric.New("datapoint",
+					map[string]string{"host": "pg123"},
+					map[string]any{"message": msg},
+					time.Now()))
+			}
+			acc := runClassifyTest(t, cl, metrics)
+			got := make([]string, 0, len(acc.GetTelegrafMetrics()))
+			for _, m := range acc.GetTelegrafMetrics() {
+				msg, _ := m.GetField("message")
+				got = append(got, msg.(string))
+			}
+			require.ElementsMatch(t, tt.want, got)
+		})
+	}
+}
 
-	droppedField, ok := processedMetric.GetField(cl.AggregationDroppedField)
-	require.Truef(t, ok, "could not find %q field in the returned metric; %s", cl.AggregationDroppedField, errMsg)
-	require.EqualValuesf(t, 2, droppedField, "field %q value was not %q: %s", cl.AggregationDroppedField, 2, errMsg)
+// TestSelectorMappingFirstMatchWins verifies that the first matching
+// selector_mapping entry decides the regex group.
+func TestSelectorMappingFirstMatchWins(t *testing.T) {
+	cl := &Classify{
+		SelectorTag: "host",
+		SelectorMapping: []map[string]string{
+			{`pg\d+`: "database"},
+			{`.*`: "generic"},
+		},
+		MatchField: "message",
+		ResultTag:  "severity",
+		MappedSelectorRegexes: map[string][]map[string]any{
+			"database": {{"db": ".*"}},
+			"generic":  {{"other": ".*"}},
+		},
+		Log: testLogger(),
+	}
+	m := metric.New("datapoint",
+		map[string]string{"host": "pg123"},
+		map[string]any{"message": "anything"},
+		time.Now())
 
-	totalField, ok := processedMetric.GetField(cl.AggregationTotalField)
-	require.Truef(t, ok, "could not find %q field in the returned metric; %s", cl.AggregationTotalField, errMsg)
-	require.EqualValuesf(t, 3, totalField, "field %q value was not %q; %s", cl.AggregationTotalField, 3, errMsg)
+	acc := runClassifyTest(t, cl, []telegraf.Metric{m})
+	require.Len(t, acc.GetTelegrafMetrics(), 1)
+	severity, ok := acc.GetTelegrafMetrics()[0].GetTag("severity")
+	require.True(t, ok)
+	require.Equal(t, "db", severity)
+}
 
-	unknownField, ok := processedMetric.GetField("unknown")
-	require.Truef(t, ok, "could not find %q field in the returned metric; %s", "unknown", errMsg)
-	require.EqualValuesf(t, 2, unknownField, "field %q value was not %q; %s", "unknown", 2, errMsg)
+// TestMultiKeyCategoryEntry verifies that a mapped_selector_regexes element
+// with more than one category is rejected, since its order would be random.
+func TestMultiKeyCategoryEntry(t *testing.T) {
+	cl := &Classify{
+		MatchField: "message",
+		ResultTag:  "severity",
+		MappedSelectorRegexes: map[string][]map[string]any{
+			"database": {{"warning": "x", "critical": "x"}},
+		},
+		Log: testLogger(),
+	}
+	require.ErrorContains(t, cl.Init(), "more than one key")
+}
 
-	warningField, ok := processedMetric.GetField("warning")
-	require.Truef(t, ok, "could not find %q field in the returned metric; %s", "warning", errMsg)
-	require.EqualValuesf(t, 1, warningField, "field %q value was not %q; %s", "warning", 1, errMsg)
+// aggregationConfig returns a config with one regex group whose categories
+// match their own upper-cased names, and summary/group aggregation enabled.
+func aggregationConfig(summaryFields, groupFields []string, includeZeroes bool) *Classify {
+	return &Classify{
+		DefaultRegexGroup: "database",
+		MatchField:        "message",
+		ResultTag:         "severity",
+		DefaultCategory:   "unknown",
+		MappedSelectorRegexes: map[string][]map[string]any{
+			"database": {{"okay": "OKAY"}, {"warning": "WARNING"}, {"critical": "CRITICAL"}},
+		},
+		AggregationPeriod:         config.Duration(time.Hour),
+		AggregationMeasurement:    "status",
+		AggregationTotalField:     "total",
+		AggregationSummaryTag:     "summary",
+		AggregationSummaryValue:   "full",
+		AggregationSummaryFields:  summaryFields,
+		AggregationGroupTag:       "host_type",
+		AggregationGroupFields:    groupFields,
+		AggregationIncludesZeroes: includeZeroes,
+		Log:                       testLogger(),
+	}
+}
+
+// aggregate classifies the given messages and flushes one aggregation period
+// directly, without starting the aggregation goroutine.
+func aggregate(t *testing.T, cl *Classify, messages ...string) []telegraf.Metric {
+	t.Helper()
+	require.NoError(t, cl.Init())
+	acc := &testutil.Accumulator{}
+	cl.acc = acc
+	for _, msg := range messages {
+		require.NoError(t, cl.Add(metric.New("datapoint", nil,
+			map[string]any{"message": msg}, time.Now()), acc))
+	}
+	acc.ClearMetrics()
+	cl.outputAggregationData(time.Unix(0, 0))
+	return acc.GetTelegrafMetrics()
+}
+
+// TestAggregationFieldsFilter verifies that aggregation output carries only the
+// configured fields, with zeroes added on request for every aggregation type.
+func TestAggregationFieldsFilter(t *testing.T) {
+	tests := []struct {
+		name          string
+		includeZeroes bool
+		want          []telegraf.Metric
+	}{
+		{
+			name: "without zeroes",
+			want: []telegraf.Metric{
+				metric.New("status", map[string]string{"summary": "full"},
+					map[string]any{"warning": 2}, time.Unix(0, 0), telegraf.Counter),
+				metric.New("status", map[string]string{"host_type": "database"},
+					map[string]any{"warning": 2}, time.Unix(0, 0), telegraf.Counter),
+			},
+		},
+		{
+			name:          "with zeroes",
+			includeZeroes: true,
+			want: []telegraf.Metric{
+				metric.New("status", map[string]string{"summary": "full"},
+					map[string]any{"warning": 2}, time.Unix(0, 0), telegraf.Counter),
+				metric.New("status", map[string]string{"host_type": "database"},
+					map[string]any{"warning": 2, "critical": 0}, time.Unix(0, 0), telegraf.Counter),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cl := aggregationConfig([]string{"warning"}, []string{"warning", "critical"}, tt.includeZeroes)
+			got := aggregate(t, cl, "WARNING", "WARNING", "OKAY")
+			testutil.RequireMetricsEqual(t, tt.want, got, testutil.SortMetrics())
+		})
+	}
+}
+
+// TestAggregationAllZeroSuppressed verifies that a point whose configured
+// fields are all zero is not emitted, even with aggregation_includes_zeroes.
+func TestAggregationAllZeroSuppressed(t *testing.T) {
+	cl := aggregationConfig([]string{"critical"}, []string{"critical"}, true)
+	require.Empty(t, aggregate(t, cl, "OKAY", "WARNING"))
+}
+
+// TestAggregationDefaultCategoryField verifies that default_category may be
+// listed as an aggregation field and is counted.
+func TestAggregationDefaultCategoryField(t *testing.T) {
+	cl := aggregationConfig([]string{"unknown", "total"}, []string{"unknown"}, false)
+	want := []telegraf.Metric{
+		metric.New("status", map[string]string{"summary": "full"},
+			map[string]any{"unknown": 1, "total": 2}, time.Unix(0, 0), telegraf.Counter),
+		metric.New("status", map[string]string{"host_type": "database"},
+			map[string]any{"unknown": 1}, time.Unix(0, 0), telegraf.Counter),
+	}
+	got := aggregate(t, cl, "no match here", "OKAY")
+	testutil.RequireMetricsEqual(t, want, got, testutil.SortMetrics())
+}
+
+// TestAggregationPartialConfig verifies that half-set aggregation options are
+// rejected, while omitting aggregation_period alone disables aggregation.
+func TestAggregationPartialConfig(t *testing.T) {
+	fields := []string{"okay"}
+	tests := []struct {
+		name    string
+		modify  func(cl *Classify)
+		wantErr string
+	}{
+		{name: "group tag without fields", modify: func(cl *Classify) { cl.AggregationGroupFields = nil },
+			wantErr: "aggregation_group_tag and aggregation_group_fields"},
+		{name: "selector fields without tag", modify: func(cl *Classify) { cl.AggregationSelectorFields = fields },
+			wantErr: "aggregation_selector_tag and aggregation_selector_fields"},
+		{name: "summary fields without tag", modify: func(cl *Classify) {
+			cl.AggregationSummaryTag, cl.AggregationSummaryValue = "", ""
+		}, wantErr: "aggregation_summary_tag and aggregation_summary_fields"},
+		{name: "period without measurement", modify: func(cl *Classify) { cl.AggregationMeasurement = "" },
+			wantErr: "aggregation_measurement must be set"},
+		{name: "no period disables aggregation", modify: func(cl *Classify) { cl.AggregationPeriod = 0 }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cl := aggregationConfig(fields, fields, false)
+			tt.modify(cl)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, cl.Init(), tt.wantErr)
+				return
+			}
+			require.NoError(t, cl.Init())
+			require.Empty(t, cl.aggregators)
+		})
+	}
+}
+
+// panickingAccumulator panics on its first aggregation output only.
+type panickingAccumulator struct {
+	testutil.Accumulator
+	panicked atomic.Bool
+}
+
+func (a *panickingAccumulator) AddCounter(measurement string, fields map[string]any, tags map[string]string, t ...time.Time) {
+	if a.panicked.CompareAndSwap(false, true) {
+		panic("boom")
+	}
+	a.Accumulator.AddCounter(measurement, fields, tags, t...)
+}
+
+// TestAggregationSurvivesPanic verifies that a panic while emitting
+// aggregation data does not stop later periods from being emitted, and that
+// Stop still returns.
+func TestAggregationSurvivesPanic(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping aggregation test in short mode")
+	}
+	cl := aggregationConfig([]string{"okay"}, nil, false)
+	cl.AggregationGroupTag = ""
+	cl.AggregationPeriod = config.Duration(time.Second)
+	require.NoError(t, cl.Init())
+
+	acc := &panickingAccumulator{}
+	require.NoError(t, cl.Start(acc))
+	okay := func() telegraf.Metric {
+		return metric.New("datapoint", nil, map[string]any{"message": "OKAY"}, time.Now())
+	}
+	require.NoError(t, cl.Add(okay(), acc))
+	require.Eventually(t, acc.panicked.Load, 3*time.Second, 50*time.Millisecond)
+
+	require.NoError(t, cl.Add(okay(), acc))
+	require.Eventually(t, func() bool { return acc.NMetrics() > 0 }, 3*time.Second, 50*time.Millisecond,
+		"no aggregation output after the panic")
+
+	stopped := make(chan struct{})
+	go func() {
+		cl.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "Stop did not return")
+	}
+}
+
+// TestNoUsableRegexGroup verifies that a config without a selector must name
+// a default_regex_group.
+func TestNoUsableRegexGroup(t *testing.T) {
+	cl := &Classify{
+		MatchField: "message",
+		ResultTag:  "severity",
+		MappedSelectorRegexes: map[string][]map[string]any{
+			"database": {{"okay": "OKAY"}},
+		},
+		Log: testLogger(),
+	}
+	require.ErrorContains(t, cl.Init(), "default_regex_group must be set")
+}
+
+// TestUnknownGroupNotAggregated verifies that a selector value passed through
+// by "*" that names no regex group does not become a per-group aggregation key.
+func TestUnknownGroupNotAggregated(t *testing.T) {
+	cl := aggregationConfig([]string{"total"}, []string{"total"}, false)
+	cl.DefaultRegexGroup = ""
+	cl.SelectorTag = "host"
+	cl.SelectorMapping = []map[string]string{{".*": "*"}}
+	require.NoError(t, cl.Init())
+	acc := &testutil.Accumulator{}
+	cl.acc = acc
+	for _, host := range []string{"database", "web01"} {
+		require.NoError(t, cl.Add(metric.New("datapoint", map[string]string{"host": host},
+			map[string]any{"message": "OKAY"}, time.Now()), acc))
+	}
+	acc.ClearMetrics()
+	cl.outputAggregationData(time.Unix(0, 0))
+
+	want := []telegraf.Metric{
+		metric.New("status", map[string]string{"summary": "full"},
+			map[string]any{"total": 2}, time.Unix(0, 0), telegraf.Counter),
+		metric.New("status", map[string]string{"host_type": "database"},
+			map[string]any{"total": 1}, time.Unix(0, 0), telegraf.Counter),
+	}
+	testutil.RequireMetricsEqual(t, want, acc.GetTelegrafMetrics(), testutil.SortMetrics())
+}
+
+// TestEmptyCategoryName verifies that an empty category name is rejected.
+func TestEmptyCategoryName(t *testing.T) {
+	cl := aggregationConfig(nil, nil, false)
+	cl.AggregationSummaryTag, cl.AggregationSummaryValue, cl.AggregationGroupTag = "", "", ""
+	cl.MappedSelectorRegexes["database"] = append(cl.MappedSelectorRegexes["database"],
+		map[string]any{"": "timeout"})
+	require.ErrorContains(t, cl.Init(), "empty category name")
+}
+
+// TestSelectorAggregationWithoutSelector verifies that selector aggregation
+// requires a selector to bin by.
+func TestSelectorAggregationWithoutSelector(t *testing.T) {
+	cl := aggregationConfig([]string{"okay"}, []string{"okay"}, false)
+	cl.AggregationSelectorTag = "host"
+	cl.AggregationSelectorFields = []string{"okay"}
+	require.ErrorContains(t, cl.Init(), "aggregation_selector_tag requires selector_tag or selector_field")
+
+	cl.SelectorTag = "host"
+	require.NoError(t, cl.Init())
+	require.Len(t, cl.aggregators, 3)
+}
+
+// TestCategoryWithoutRegexes verifies that a category declared without regexes
+// never matches but may still be named in drop_categories and aggregation fields.
+func TestCategoryWithoutRegexes(t *testing.T) {
+	cl := aggregationConfig([]string{"warning", "placeholder", "total"}, []string{"total"}, false)
+	cl.MappedSelectorRegexes["database"] = append(cl.MappedSelectorRegexes["database"],
+		map[string]any{"placeholder": make([]any, 0)})
+	cl.DropCategories = "placeholder"
+	want := []telegraf.Metric{
+		metric.New("status", map[string]string{"summary": "full"},
+			map[string]any{"warning": 1, "total": 1}, time.Unix(0, 0), telegraf.Counter),
+		metric.New("status", map[string]string{"host_type": "database"},
+			map[string]any{"total": 1}, time.Unix(0, 0), telegraf.Counter),
+	}
+	got := aggregate(t, cl, "WARNING")
+	testutil.RequireMetricsEqual(t, want, got, testutil.SortMetrics())
 }

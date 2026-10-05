@@ -1,498 +1,511 @@
 # Classify Processor Plugin
 
-The `classify` plugin makes decisions based on comparison of designated
-string tag and field values against groups of regular-expression patterns.
-The result of those decisions is either that an input data point is
-dropped, or a new tag or field is created showing the classification
-of the input data.  The original input data is always left undisturbed;
-no replacement substitutions are carried out by the regular expression
-matching.
+The `classify` plugin classifies metrics by matching a designated tag or field
+value against groups of regular expressions. Each input metric either passes
+through with a new result tag/field set to the matched category name, or is
+dropped. Apart from the result tag or field, which replaces any existing tag
+or field of the same name, the metric is not modified.
 
-While performing input data classification, the `classify` plugin
-supports limited transient internal tag/field value mapping.
-This allows consolidation of duplicate sets of regular expressions in
-the configuration.  The original tag/field value is left undisturbed,
-and the mapped value does not appear in the plugin output.
+The plugin optionally supports a selector mapping step: a tag or field value
+is mapped to the name of a regex group, allowing distinct sets of regexes to
+be applied to different classes of input without repeating configuration.
 
-The tag/field mapping is included in the `classify` plugin because
-otherwise one would need to invoke the `enum` plugin beforehand to
-perform value mapping, and the `fielddrop` or `tagexclude` option would
-need to be applied to the `classify` plugin to strip out the mapped
-values needed only on a transient basis for the classification logic.
-The extra parsing and re-serialization of the data that would be invoked
-by using the `enum` plugin in the pipeline seems like pointless overhead.
+In addition to classification, the plugin can accumulate per-period statistics
+and emit them as separate metrics, acting as a lightweight aggregator.
 
-In addition to those actions, the `classify` plugin supports accumulation
-of classification statistics and periodic output of those statistics.
-In this sense, the plugin acts as an aggregator, but only appending extra
-data to the stream without altering the output of classification results.
+⭐ Telegraf v1.27.4
+🏷️ filtering, transformation
+💻 all
 
-The statistics aggregation is included in the `classify` plugin because
-of the following bug in Telegraf 1.x:
+## Global configuration options <!-- @/docs/includes/plugin_config.md -->
 
-> aggregators should not re-run processors
-[#7993](https://github.com/influxdata/telegraf/issues/7993)
+Plugins support additional global and plugin configuration settings for tasks
+such as modifying metrics, tags, and fields, creating aliases, and configuring
+plugin ordering. See [CONFIGURATION.md][CONFIGURATION.md] for more details.
 
-That issue is slated to be addressed in Telegraf 2.0, but there is no
-timeline for its release.  In the meantime, we don't want the `classify`
-plugin to be invoked a second time after classification statistics
-are collected.
+[CONFIGURATION.md]: ../../../docs/CONFIGURATION.md#plugins
 
-## Motivation
+## When to use classify
 
-The text below describes the processing model in some detail, which
-upon initial reading may be a bit confusing.  It may help to know that
-this plugin was developed in support of processing syslog messages from
-multiple hosts that may or may not share the same computational purpose
-and therefore may or may not generate the same types of syslog messages.
-We want to support commonality of configuration where that is appropriate,
-while allowing distinct configuration where that is needed.  Hence there
-is a bit of indirection at the beginning of the processing stream, to
-identify the kind of regular expressions to be applied to a given input
-data point.
+The plugin turns an open-ended value, such as a log message, a URL path or an
+SNMP trap description, into one of a few named categories, and can count how
+often each category was seen. Typical uses, shown in the [examples](#examples):
 
-Beyond that initial identification, we wanted to be able to recognize
-a variety of different messages that might appear from a given source,
-classifying them into just a few result categories.  So the overall
-logical structure of the regular expressions that can be configured is:
+- bounding tag cardinality, by replacing unbounded values with a few classes;
+- normalizing severities or log levels that each source words differently;
+- dropping known noise while measuring how much of it there is, and where it
+  comes from;
+- deriving the states that an alerting or monitoring system expects.
 
-```markdown
-regex_group_name
-    category_name
-        regex
-        regex
-        regex
-    category_name
-        regex
-        regex
-regex_group_name
-    category_name
-        regex
-        regex
-        regex
-    category_name
-        regex
-        regex
+The stock plugins cover parts of this, but not the combination:
+
+| Need | `classify` | Closest stock alternative |
+| --- | --- | --- |
+| Map a value to one of a few names by trying an ordered list of regexes, first match wins | Categories are tried in order; each may hold any number of regexes; the category name is written as is | `processors.regex` runs every conversion in turn, so the last match wins and a catch-all must come first; each regex is its own block with its own replacement. `enum` and `lookup` only match exact values. |
+| Fall back to a default state when nothing matches | `default_category` | `processors.defaults` only fills a missing tag or field, so it needs the regex result written to a separate key first. |
+| Apply different rules to different kinds of sources | One `selector_mapping` picks a regex group per metric, with a fallback group | Several processor instances, each limited with `tagpass` globs. Telegraf metric filters cannot express "every source the other instances did not take", and every instance repeats the shared rules. |
+| Drop uninteresting messages as part of the same decision | `drop_categories`, or no match without `default_category` | `processors.filter` matches tag values with globs only; `metricpass` can test a regex, but as a separate rule set that duplicates the classification. |
+| Count states per period, including dropped metrics | `aggregation_*` options count every metric seen, bucketed by summary, regex group or selector value | `aggregators.valuecounter` runs after the processors, so it never sees dropped metrics; it counts per series (all tags) and names fields `<field>_<value>`. |
+
+Prefer the stock plugins when they are enough: `enum` or `lookup` for
+exact-value lookups, `template` for building values from other tags, `regex`
+for rewriting parts of a value, and `starlark` for logic that does not fit any
+declarative plugin.
+
+## Processing Model
+
+```text
+input metric
+    │
+    ├─ resolve regex group (selector → group mapping, or default_regex_group)
+    │
+    ├─ match against category regexes in that group (first match wins)
+    │
+    ├─ apply result tag/field to metric
+    │
+    └─ pass downstream  ─OR─  drop (category in drop_categories, or no match
+                                    and no default_category)
 ```
 
-with as many items at each level of the hierarchy (`regex_group_name`,
-`category_name`, `regex`) as needed.  To that end, we wanted to make
-the specification of that hierarchy as compact as possible in the config
-file, so the administrator does not get lost in the surrounding syntax
-and can concentrate on the task at hand.
+The selector resolves to one of several regex groups; only the selected group's
+category regexes are tested against the match item:
 
-Given this model of processing, it seemed sensible to implement it in a
-general way, not specifically tied to syslog messages.  So the abstract
-model of processing is couched in other terms, in the hope that this
-plugin may find use in other contexts.  The sample setup shown at the
-end of [CONFIGURATION.md](CONFIGURATION.md) may help to clarify actual
-practical application of this plugin.
+```text
+                    ┌─────────────────────────────────────┐
+        selector ──►│   selector to regex-group mapping   │
+                    └─────────────────────────────────────┘
+                                        │
+                                  regex group name
+                                        │
+                                        ▼
+         ┌─ regex group 1 ────────────────────────────────┐
+         │  ┌──────────┐  ┌──────────┐  ┌──────────┐     │
+         │  │categoryA │  │categoryB │  │categoryC │     │
+         │  │ regexes  │  │ regexes  │  │ regexes  │     │
+         │  └──────────┘  └──────────┘  └──────────┘     │
+         └────────────────────────────────────────────────┘
 
-## Comparison to the `regex` processor
+match ──►┌─ regex group 2 (selected) ─────────────────────┐──► result
+item     │  ┌──────────┐  ┌──────────┐  ┌──────────┐     │
+         │  │categoryA │  │categoryB │  │categoryC │     │
+         │  │ regexes  │  │ regexes  │  │ regexes  │     │
+         │  └──────────┘  └──────────┘  └──────────┘     │
+         └────────────────────────────────────────────────┘
 
-* An initial calculation is run to dynamically select amongst multiple
-sets of regular expressions.
-* Groups of related regular expressions are easier to specify, instead
-of one-at-a-time setup.
-* A single tag or field is created, representing the result of the
-classification.
-* No tags or fields are overwritten, unless the configured result
-tag/field is already present in the incoming data.
-* Aggregate processing statistics are emitted on a regular basis,
-separate from passing through or dropping classified data points.
+         ┌─ regex group 3 ────────────────────────────────┐
+         │  ┌──────────┐  ┌──────────┐  ┌──────────┐     │
+         │  │categoryA │  │categoryB │  │categoryC │     │
+         │  │ regexes  │  │ regexes  │  │ regexes  │     │
+         │  └──────────┘  └──────────┘  └──────────┘     │
+         └────────────────────────────────────────────────┘
 
-## Abstract processing model
-
-Here is a top-level view of how this plugin works, showing its essential
-simplicity.
-
-![Processing Model](processing_model.png)
-
-The processing steps are:
-
-1. Identify a selector item (tag or field), to discriminate between
-possible groups of regular expressions that might be applied to an input
-data point.
-
-1. Map the selector item's value to the name of a group of sets of
-regular expressions to match against an input data point.
-
-1. Identify a match item (tag or field) that is to be matched against
-the regular expressions chosen by the mapped selector item's value.
-
-1. Identify a result item (tag or field) that is to be added to the data
-point and contain the classification result.
-
-1. Step through each set ("category") of regular expressions in the
-selected group of such sets, matching each regular expression in turn
-against the match item's value.  The first match that succeeds determines
-the final classification.  The result value will be the name of the
-category that the matching regex belongs to.
-
-### Simplified pseudo-code
-
-_At plugin startup:_
-
-* analyze the configuration
-* create some corresponding aggregation counters (others will depend
-on details of the input data points, and be dynamically created as data
-is processed)
-* set all those counters to zero
-* initialize the required thread-synchronization objects
-* start the aggregation thread
-* start the processing thread
-
-_Processing thread, executed once for each input data point:_
-
-```markdown
-read data point
-regex_group_name = {map selector value}
-foreach regex_category in regexes[regex_group_name] {
-    foreach regex in regexes[regex_group_name][regex_category] {
-        if match_item matches regex {
-            result = regex_category
-            add result to this data point
-            update aggregation statistics (if configured), in a
-                manner synchronized with the aggregation thread
-            exit all loops for matching this data point
-        }
-    }
-}
-write out this data point
+all data point tags and fields ──────────────────────────────────────────────►
 ```
 
-_Aggregation thread, operating as a background task, at the end of each
-configured period:_
+### Choosing the regex group
 
-* synchronize access to the aggregration counters with the processing
-thread to prevent race conditions
-* spill out measurements containing all of the configured aggregation
-counters
-* zero out all the aggregation counters
+When `selector_tag` or `selector_field` is set, the regex group is resolved
+as follows:
 
-_At plugin shutdown:_
+1. A metric without the selector item is dropped, as is one whose selector
+   field is not a string.
+2. The `selector_mapping` entries are tried in order and the first one whose
+   regex matches the selector value gives the group name. `"*"` uses the
+   selector value itself as the group name, and `""` drops the metric.
+3. When no entry matches, including when `selector_mapping` is not set,
+   `default_regex_group` is used. When that is not set either, the metric is
+   dropped.
+4. When the resolved name is not a group with category regexes in
+   `mapped_selector_regexes`, for example a `"*"` value that has no group of
+   its own, `default_regex_group` is used, or the metric is dropped when it is
+   not set.
 
-* synchronize access to the aggregration counters with the processing
-thread to prevent race conditions
-* spill out all aggregation counts collected since the last spill action
-* zero out all the aggregation counters (pro forma)
-
-## Aggregated classification statistics
-
-Aggregation statistics are an invention of this plugin, meaning the
-details of their construction must be specified by the configuration
-so these measurements have a form which is acceptable to whatever
-output plugin(s) you use.  As part of that setup, the configuration must
-specify the measurement name as the principal component of the aggregated
-statistics, since it might be different from the measurement name used
-by the input data points.
-
-There are three types of aggregation-statistics output that can be
-produced, depending on how you configure this plugin.  For any of
-these types, if all of the fields to be reported in a given individual
-aggregation-data point are zero, that data point will be suppressed.
-
-* Full-volume ("summary") statistics, not sliced into smaller portions.
-Nominally, there can be one such aggregated-data point emitted at the
-end of each aggregation period.
-
-* Per-regex-group statistics.  Nominally, there can be one such
-aggregated-data point emitted at the end of each aggregation period for
-each regex group that was mapped to during that period.
-
-* Per-selector-value statistics.  Nominally, there can be one such
-aggregated-data point emitted at the end of each aggregation period for
-each distinct selector value that was seen during that period.
-
-The specific tag names used for the aggregation-data points are
-configurable, as are the sets of fields included in such data points,
-to adapt to your local needs.
-
-An example might help to show the utility of such constructions.
-Suppose the selector is the hostname from a syslog message, and the
-category represents the level of severity of that message (ignore, ok,
-warning, critical, unknown).  The grouping might use the hostname to
-identify the nature of the host (firewall node, compute node, network
-switch, database machine, file server, etc.), and apply regexes tailored
-to that type of host.  With those ideas in mind, we implement the sample
-configuration shown later in this document.
-
-Let's show what the aggregated-data output would look like, using a
-simple example.  Suppose we have five hosts:
-
-* `fire123`, a firewall node
-* `ora456`, an Oracle database node
-* `pg789`, a PostgreSQL database node
-* `rout237`, a router
-* `rout846`, a router
-
-Let us further suppose we map hostnames into host-types as the regex group
-names.  For purposes of this mapping, we assume that all the routers are
-running the same software, so the nature of their syslog messages will be
-the same and the matching of those messages need only be configured once.
-Also, for didactic purposes, two different kinds of databases are folded
-into the same group.  In practice, that would only be useful if either we
-had an unspecified abstraction layer running on both of those machines
-to map database-type-specific messages into some common format, or we
-simply combined all of the regexes for either type of database into the
-one group of regexes configured in this plugin for such machines.
-
-* `fire123` => `firewall`
-* `ora456` => `database`
-* `pg789` => `database`
-* `rout237` => `router`
-* `rout846` => `router`
-
-In addition, let's suppose we have the following regex categories:
-
-* `ignore`, for messages that should be dropped (but counted in this
-match category in aggregation statistics; see the `drop_categories`
-configuration option)
-* `okay`, for messages that represent an operating-normally state
-* `warning`, for messages indicating conditions of possible concern
-* `critical`, for messages indicating conditions of definite concern
-* `unknown`, for messages that we have not yet analyzed enough to develop
-specific regexes to match and otherwise classify
-
-For the example aggregated-data output shown just below, we
-have the following options in play, along with definitions of
-`aggregation_summary_fields`, `aggregation_group_fields`,
-and `aggregation_selector_fields` not shown here.  The
-`aggregation_includes_zeroes` option is enabled here for didactic
-purposes, so you can see all the aggregation-point category fields
-involved; most commonly, that would be left disabled.
+Regexes are unanchored, so `pg\\d{3}` also matches `xpg1234`; anchor them
+with `^` and `$` to match the whole value. To drop metrics whose selector is
+empty, or all selectors not listed, end the mapping with a catch-all:
 
 ```toml
-aggregation_measurement     = 'status'
-aggregation_summary_tag     = 'summary'
-aggregation_summary_value   = 'full'
-aggregation_dropped_field   = 'dropped'
-aggregation_total_field     = 'total'
-aggregation_group_tag       = 'host_type'
-aggregation_selector_tag    = 'host'
-aggregation_includes_zeroes = true
+selector_mapping = [
+  { "^fire\\d{3}$" = "firewall" },
+  { "^pg\\d{3}$"   = "database" },
+  { "^$"           = ""         },  # empty selector: drop
+  { ".*"           = ""         },  # anything else: drop
+]
 ```
 
-With all of that (and a bit more) in play, the available aggregation
-counts might represent answers to the following kinds of questions.
-We show the corresponding output for this example setup in InfluxDB
-Line Protocol format.  Recall that said format names the measurement,
-concatenated directly with all the (optional) tag data, followed by
-all the field data, followed by an optional timestamp (which we do not
-show here).
+Without a selector, every metric uses `default_regex_group`.
 
-_What is the total volume of messages across my infrastructure?_
+### Choosing the category
 
-```markdown
-## Show the overall distribution of classification states and plugin
-## activity.  Bin the counts of data points reported here by {category}
-## only, without discriminating by {group} or {selector}.
-status,summary=full ignore=5,okay=3,warning=8,critical=2,unknown=1,dropped=5,total=19
+The match item is read from `match_tag`, or from `match_field`, which must
+hold a string; a metric without it is dropped. The categories of the selected
+group are then tried in the order they are listed, and within a category its
+regexes are tried in order; the first regex that matches decides the category.
+
+- When nothing matches, `default_category` is used, or the metric is dropped
+  when it is not set. A last category with the regex `.*` has the same effect
+  as `default_category`, but is counted under its own name.
+- A metric whose category is in `drop_categories` is dropped.
+- Otherwise the category name is written to `result_tag` or `result_field`,
+  replacing any value already there, and the metric passes downstream.
+
+A category may be listed with no regexes, such as `{ warning = [] }`, as a
+placeholder for a state that a group has no rules for yet. It never matches,
+but its name may still be used in `drop_categories` and the aggregation field
+lists.
+
+## Aggregation
+
+When `aggregation_period` is set, the plugin emits classification counters as
+separate metrics, named by `aggregation_measurement`, at the end of each period.
+Omitting `aggregation_period` disables aggregation even if the other aggregation
+options are set.
+
+Three independent aggregation types can be enabled simultaneously:
+
+- **Summary**: one metric per period with a fixed tag value, counting across all
+  regex groups and selectors.
+- **By group**: one metric per active regex group per period.
+- **By selector**: one metric per observed selector value per period.
+
+Each aggregation type emits only the fields listed in its `*_fields` option.
+Fields with a zero count are omitted unless `aggregation_includes_zeroes` is
+enabled; a data point whose listed fields are all zero is never emitted.
+
+Every metric that reaches the plugin is counted, whether it passes or is
+dropped:
+
+- `aggregation_total_field` counts every metric.
+- `aggregation_dropped_field` counts every dropped metric, for any reason.
+- A category field counts the metrics classified as that category, including
+  `default_category` and the categories in `drop_categories`. A metric dropped
+  in `drop_categories` is therefore counted under both its category and the
+  dropped field.
+
+The summary counts all metrics. The per-group counts only include metrics for
+which a regex group was found, under that group's name, which is
+`default_regex_group` for metrics that fell back to it. The per-selector
+counts only include metrics with a non-empty selector value, under the value
+as read from the metric, before `selector_mapping` is applied. Mind the number
+of distinct selector values, since each one becomes a separate series.
+
+The counts are emitted at the end of each period, with that time as the
+timestamp. Periods are aligned to the UTC clock, so a `10m` period emits at
+`:00`, `:10` and so on, and a `1h` period on the hour. The counts are reset
+after each emission, and the remaining counts are emitted when Telegraf stops.
+Unlike an aggregator plugin, this plugin sees the metrics it drops, which is
+what makes the dropped and total counts possible.
+
+The aggregation metrics are passed downstream like the classified metrics:
+through the processors with a higher `order` and to every output. Use
+`namepass` or `namedrop` with the `aggregation_measurement` name to send them
+only to the outputs that should receive them.
+
+## Example output
+
+```text
+# Passthrough metric with result field added:
+syslog,host=pg123 message="Tablespace users free space is low",status="warning" 1700000000
+
+# Summary aggregation after one period:
+aggregated_status,summary=full okay=8i,warning=3i,critical=1i,dropped=6i,total=18i 1700000400
+
+# Per-group aggregation:
+aggregated_status,host_type=database okay=8i,warning=2i,total=10i 1700000400
+aggregated_status,host_type=firewall warning=1i,critical=1i,dropped=6i,total=8i 1700000400
 ```
-
-_What kinds of machines/devices are generating lots of messages I might
-care about?_
-
-```markdown
-## Show a coarse distribution of incoming data, based on the mapping
-## of {selector} values to {group} values.  Bin the counts reported
-## here by {group} and {category} only, ignoring the particular
-## {selector} values involved.  For this example, we have chosen to
-## report only known problem states and the total activity for each
-## kind of host.
-# aggregation_group_fields = [ 'warning', 'critical', 'total' ]
-status,host_type=firewall warning=2,critical=1,total=4
-status,host_type=database warning=5,critical=0,total=8
-status,host_type=router warning=1,critical=1,total=7
-```
-
-_What kinds of services in my infrastructure are in good or bad shape?_
-
-```markdown
-## Show a coarse distribution of incoming data, based on the mapping
-## of {selector} values to {group} values.  Bin the counts reported
-## here by {group} and {category} only, ignoring the particular
-## {selector} values involved.  For this example, we have chosen to
-## report the full set of calculated {category} states and nothing
-## else, because that is all we care to graph.
-# aggregation_group_fields = [
-#   'ignore', 'okay', 'warning', 'critical', 'unknown'
-# ]
-status,host_type=firewall ignore=0,okay=1,warning=2,critical=1,unknown=0
-status,host_type=database ignore=1,okay=2,warning=5,critical=0,unknown=0
-status,host_type=router ignore=4,okay=0,warning=1,critical=1,unknown=1
-```
-
-_What is the bird's-eye view of how my infrastructure is running?_
-
-```markdown
-## Show a coarse distribution of incoming data, based on the mapping
-## of {selector} values to {group} values.  Bin the counts reported
-## here by {group} and {category} only.  For this example, we not only
-## collect the data needed for later per-service-type reporting, we
-## also include total-traffic counts, because the NOC manager watches
-## those numbers in a dashboard as a proxy for overall trouble to see
-## if he needs to call in extra help for particular kinds of services.
-# aggregation_group_fields = [
-#   'ignore', 'okay', 'warning', 'critical', 'unknown', 'total'
-# ]
-status,host_type=firewall ignore=0,okay=1,warning=2,critical=1,unknown=0,total=4
-status,host_type=database ignore=1,okay=2,warning=5,critical=0,unknown=0,total=8
-status,host_type=router ignore=4,okay=0,warning=1,critical=1,unknown=1,total=7
-```
-
-_What particular machines are generating lots of messages, regardless
-of severity?_
-
-```markdown
-## Show just the volume of incoming data across selector values,
-## regardless of utility or classification.  This might be useful,
-## for instance, if we have set up upstream filtering so only
-## serious-state messages are forwarded to where the Telegraf plugin
-## sees them, and all we need to graph is the total traffic for each
-## host.  There would be no need to waste resources by generating
-## and storing other categories of counts.
-# aggregation_selector_fields = [ 'total' ]
-status,host=fire123 total=4
-status,host=ora456 total=2
-status,host=pg789 total=6
-status,host=rout237 total=7
-```
-
-_What were the overall states of particular machines during each
-reporting period?_
-
-```markdown
-## Show detailed counts of classifications on a per-selector-value basis.
-## Bin the counts by the combination of {selector} and {category}.  We
-## don't care about the other available data (dropped-data-point and
-## total-data-point counts), because with the full set of category counts,
-## we will have all the information we need to act upon for everyday
-## system administration and troubleshooting.
-# aggregation_selector_fields = [
-#   'ignore', 'okay', 'warning', 'critical', 'unknown'
-# ]
-status,host=fire123 ignore=0,okay=1,warning=2,critical=1,unknown=0
-status,host=ora456 ignore=0,okay=1,warning=1,critical=0,unknown=0
-status,host=pg789 ignore=1,okay=1,warning=4,critical=0,unknown=0
-status,host=rout237 ignore=4,okay=0,warning=1,critical=1,unknown=1
-```
-
-_How healthy are my servers, in the eyes of everyone who cares in one
-way or another?_
-
-```markdown
-## Show detailed counts of classifications on a per-selector-value basis,
-## and also capture the total-traffic count for each host.  The latter
-## will be used not for the NOC operators, but for a management report to
-## direct attention to equipment that may need to be upgraded or replaced.
-# aggregation_selector_fields = [
-#   'ignore', 'okay', 'warning', 'critical', 'unknown', 'total'
-# ]
-status,host=fire123 ignore=0,okay=1,warning=2,critical=1,unknown=0,total=4
-status,host=ora456 ignore=0,okay=1,warning=1,critical=0,unknown=0,total=2
-status,host=pg789 ignore=1,okay=1,warning=4,critical=0,unknown=0,total=6
-status,host=rout237 ignore=4,okay=0,warning=1,critical=1,unknown=1,total=7
-```
-
-Which of these statistics need to be aggregated and output depends on
-your own use case, so this work is all configurable.  Each kind of
-statistic can be individually enabled by configuration.  If none of
-them are enabled, no aggregation counting will occur and no aggregated
-measurements will be generated.
-
-Notice that no aggregation output appeared for host `rout846`.  That's
-because it sent no messages during this period.  The aggregation does not
-manufacture and send out total=0 or equivalent data points in this case.
-That has an effect on how you set up valid graphing for aggregation data.
-(You shouldn't be connecting successive available non-zero data points
-with lines, as that would be misleading.  If your graphing tool has the
-ability to treat missing values in a graph interval as zero values,
-then you could reasonably connect successive data points with lines.
-Beyond such simple advice, the topic of metric graphing is outside the
-scope of this plugin documentation.)
 
 ## Configuration
 
 ```toml @sample.conf
 # Classify Telegraf data points according to user-specified rules.
 [[processors.classify]]
-  ## The detailed configuration data for the classify plugin lives
-  ## in a separate file, whose path is given here.
-  classify_config_file = '/etc/telegraf/telegraf.d/classify.toml'
+  ## Tag or field used to select which regex group to apply.
+  ## These are mutually exclusive. Omit both to use default_regex_group directly,
+  ## which is then required.
+  # selector_tag = "host"
+  # selector_field = ""
+
+  ## Ordered list of regex-to-group-name mappings for the selector value.
+  ## Each element must have exactly one key (the regex) and one value (the group name).
+  ## Use "*" as the group name to pass the selector value through unchanged.
+  ## selector_mapping = [
+  ##   { "fire\\d{3}" = "firewall" },
+  ##   { "pg\\d{3}"   = "database" },
+  ## ]
+
+  ## Regex group to use when no selector_mapping entry matches, or when the
+  ## matching entry names a group that is not defined. It must name a group
+  ## defined in mapped_selector_regexes. An entry that maps to "" drops the
+  ## metric without this fallback. If empty and no defined group is found, the
+  ## metric is dropped.
+  # default_regex_group = ""
+
+  ## Tag or field whose value is matched against the category regexes.
+  ## Exactly one must be defined.
+  # match_tag = ""
+  # match_field = "message"
+
+  ## Category applied when no regex matches. Metrics are dropped if unset.
+  # default_category = ""
+
+  ## Categories whose metrics are dropped after classification.
+  ## Accepts a single string or an array of strings.
+  ## drop_categories = ["ignore", "unknown"]
+
+  ## Tag or field where the classification result is written.
+  ## Exactly one must be defined.
+  # result_tag = ""
+  # result_field = "status"
+
+  ## Aggregation options. Aggregation is enabled by setting aggregation_period
+  ## along with at least one of the summary/group/selector sets below; it then
+  ## requires aggregation_measurement. Omit aggregation_period to disable it.
+  # aggregation_period = "10m"
+  # aggregation_measurement = "aggregated_status"
+
+  ## Field name for dropped-metric counts in aggregation output.
+  ## Each *_fields list below names the fields emitted for that aggregation:
+  ## regex categories, default_category, and these dropped/total fields.
+  # aggregation_dropped_field = "dropped"
+
+  ## Field name for total-metric counts in aggregation output.
+  # aggregation_total_field = "total"
+
+  ## Summary aggregation: one metric per period with a fixed tag value.
+  ## All three options must be set together, or none of them.
+  # aggregation_summary_tag = "summary"
+  # aggregation_summary_value = "full"
+  # aggregation_summary_fields = ["okay", "warning", "critical", "unknown", "dropped", "total"]
+
+  ## Per-regex-group aggregation: one metric per active group per period.
+  ## Both options must be set together, or neither.
+  # aggregation_group_tag = "host_type"
+  # aggregation_group_fields = ["okay", "warning", "critical", "unknown", "dropped", "total"]
+
+  ## Per-selector-value aggregation: one metric per observed selector per period.
+  ## Both options must be set together, or neither; requires selector_tag or
+  ## selector_field.
+  # aggregation_selector_tag = "host"
+  # aggregation_selector_fields = ["okay", "warning", "critical", "unknown", "dropped", "total"]
+
+  ## Include zero-value fields in aggregation output metrics. Metrics whose
+  ## fields would all be zero are never emitted.
+  # aggregation_includes_zeroes = false
+
+  ## Per-group ordered category definitions.
+  ## Each category value may be a single regex string, a multi-line string
+  ## (one regex per non-blank, trimmed line), or an array of regex strings.
+  ## A category with no regexes never matches, but its name may still be used
+  ## in drop_categories and the aggregation *_fields lists.
+  ## This table must come last: every key after its header belongs to it.
+  ## [processors.classify.mapped_selector_regexes]
+  ##   database = [
+  ##     { ignore   = "DB client connected" },
+  ##     { okay     = "Database is starting up" },
+  ##     { warning  = "Tablespace \\w+ free space is low" },
+  ##     { critical = "Database is shutting down" },
+  ##     { unknown  = ".*" },
+  ##   ]
+  ##   firewall = [
+  ##     { ignore   = "low-priority traffic" },
+  ##     { warning  = "login attempt" },
+  ##     { critical = "intrusion detected" },
+  ##     { unknown  = ".*" },
+  ##   ]
 ```
 
-The `classify` plugin needs complex data for its configuration,
-including TOML literal strings as hash keys and arrays of hashes.
-However, the Telegraf 1.x TOML parser is limited in its functionality
-and does not support the full TOML v1.0.0 specification.  Hopefully,
-that will be addressed in Telegraf 2.0.  In the meantime, we are forced
-to move the configuration for this plugin out to a separate file, and
-we leave behind only a single plugin-specific option to be processed by
-the Telegraf-internal parser.
+## Options
 
-At the point where Telegraf itself is able to parse full TOML v1.0.0,
-this config option will be deprecated, and the standard recommended
-setup will have the plugin configuration in the usual location.
+### Selector options
 
-See [CONFIGURATION.md](CONFIGURATION.md) for detailed description of
-configuration options.
+| Option | Description |
+| --- | --- |
+| `selector_tag` | Tag whose value selects the regex group. Mutually exclusive with `selector_field`. |
+| `selector_field` | Field whose value selects the regex group. |
+| `selector_mapping` | Ordered list of `{regex: group_name}` elements; the first match wins. Use `"*"` as the group name to pass the selector value through unchanged. A group name that is not in `mapped_selector_regexes` is logged as a warning at startup. |
+| `default_regex_group` | Regex group to use when no selector mapping entry matches or the mapped group is not defined; an entry that maps to `""` drops the metric instead. Must name a group in `mapped_selector_regexes`; required when neither `selector_tag` nor `selector_field` is set. |
 
-## Bugs
+### Classification options
 
-The built-in TOML parser in Telegraf 1.x was written some time ago and
-does not handle the full syntax of TOML v1.0.0.  We are therefore forced
-to invoke a separate TOML parser from within the plugin to provide support
-for a compact and readable configuration.  Hopefully this situation will
-be fixed in Telegraf 2.0, where we would expect Telegraf to adopt the
-github.com/BurntSushi/toml package for TOML parsing, as the `classify`
-plugin has currently done.
+| Option | Description |
+| --- | --- |
+| `match_tag` | Tag whose value is matched against category regexes. Exactly one of `match_tag`/`match_field` is required. |
+| `match_field` | Field whose value is matched against category regexes. |
+| `mapped_selector_regexes` | TOML table mapping each group name to an ordered list of `{category: regex}` entries, each with exactly one category. Category values may be a single regex string, a multi-line string (one trimmed regex per non-blank line), or an array of strings. Category names must be non-empty; a category with no regexes never matches, but its name may still be used in `drop_categories` and the aggregation `*_fields` lists. |
+| `default_category` | Category to apply when no regex matches. Metrics are dropped if unset and no match is found. |
+| `drop_categories` | Category name or list of names whose matched metrics are dropped after classification. |
+| `result_tag` | Tag to set to the matched category name, replacing any existing tag of that name. Exactly one of `result_tag`/`result_field` is required. |
+| `result_field` | Field to set to the matched category name, replacing any existing field of that name. |
 
-The config-file formatting is complex, both because the underlying
-structure of the data to be represented is complex, and because of
-limitations in the TOML config-file format (and its parsers) used
-by Telegraf.  (See [toml.io/en/v1.0.0](https://toml.io/en/v1.0.0) for
-the TOML specification.)  In particular, we would like the as-listed
-ordering of hash keys in a single key/value table to be accessible after
-parsing the config file, in addition to by-key lookups within the table.
-Both forms of access to the keys are important, but we are not allowed
-to quash an array of tables into a single table (thereby also avoiding
-potential duplicate keys) and retain numerically-indexed access to
-the keys.  This idea may blow your mind because you have been trained to
-think only in terms of simple arrays and simple random-iteration-order
-hashes as separate data structures (and never the twain shall meet,
-except for nesting).  If that is the case, take a look at the Boost
-Multi-index Containers Library:
+### Aggregation options
 
-  [www.boost.org/doc/libs/1_79_0/libs/multi_index/doc/index.html](
-    https://www.boost.org/doc/libs/1_79_0/libs/multi_index/doc/index.html)
+| Option | Description |
+| --- | --- |
+| `aggregation_period` | How often to emit aggregation metrics (e.g. `"5m"`). Must be ≥ 1s. |
+| `aggregation_measurement` | Measurement name for aggregation metrics. Required when `aggregation_period` is set. |
+| `aggregation_dropped_field` | Field name for the count of dropped metrics. |
+| `aggregation_total_field` | Field name for the total count of all metrics processed. |
+| `aggregation_summary_tag` | Tag name for summary aggregation. |
+| `aggregation_summary_value` | Tag value for summary aggregation. |
+| `aggregation_summary_fields` | Fields to emit in summary aggregation metrics: regex categories, `default_category`, `aggregation_dropped_field`, or `aggregation_total_field`. Set together with the summary tag and value. |
+| `aggregation_group_tag` | Tag name for per-group aggregation. |
+| `aggregation_group_fields` | Fields to emit in per-group aggregation metrics. Set together with `aggregation_group_tag`. |
+| `aggregation_selector_tag` | Tag name for per-selector aggregation. Requires `selector_tag` or `selector_field`. |
+| `aggregation_selector_fields` | Fields to emit in per-selector aggregation metrics. Set together with `aggregation_selector_tag`. |
+| `aggregation_includes_zeroes` | Include listed fields with zero counts in aggregation output; all-zero points are still suppressed. Default: `false`. |
 
-The following package seems to be an implementation of the concept for
-Go, though it's hard to tell because as of this writing the package is
-not well-documented:
+## Examples
 
-  [pkg.go.dev/github.com/eosspark/geos/libraries/multiindex](
-    https://pkg.go.dev/github.com/eosspark/geos/libraries/multiindex)
+### Bounding the cardinality of request paths
 
-We should describe how to run this plugin in a mode that simply verifies
-that a sane configuration has been supplied, without attempting to
-process any data points.
+Storing raw URL paths as tags creates a new series for every distinct path.
+Classifying them into a few route classes keeps the number of series fixed,
+and drops health checks on the way. The access log is parsed with the `grok`
+data format, which puts the path into the `request` field:
 
-We should describe how to run this plugin in a mode that logs its internal
-decisions, and tell users where to find the log, so users can debug the
-behavior of misconfigured setups.
+```toml
+[[inputs.tail]]
+  files = ["/var/log/nginx/access.log"]
+  data_format = "grok"
+  grok_patterns = ["%{COMBINED_LOG_FORMAT}"]
 
-There should be a means to control the level of logging detail, to allow
-finer granularity of logging while debugging a configuration and coarser
-granularity during production use of the plugin.
+[[processors.classify]]
+  default_regex_group = "paths"
+  match_field = "request"
+  default_category = "other"
+  drop_categories = "health"
+  result_tag = "route"
 
-## Possible future features
+  [processors.classify.mapped_selector_regexes]
+    paths = [
+      { health = ["^/healthz", "^/ready"] },
+      { api    = "^/api/" },
+      { static = ['\.(css|js|png|svg|woff2?)$'] },
+      { login  = "^/(login|logout|oauth)" },
+    ]
+```
 
-* Extend the model to support multiple independent classifications,
-possibly chained.  Chaining would mean that the `result_tag` or
-`result_field` would be used as the `selector_tag` or `selector_field`
-for a subsequent classification.  Supporting multiple independent
-classifications would also mean adding another option to tell whether
-each intermediate result in a chained classification would be output
-as well as the final classification in that chain.  These ideas await
-a definitively useful use case.
+Add `fieldexclude = ["request"]` to the outputs to drop the raw path once it
+has been classified.
+
+### Normalizing log levels across applications
+
+Each application words its severities differently. A selector on the syslog
+`appname` tag picks a rule set per application; with `"*"` the application
+name is the group name, so adding an application only takes a new group.
+Applications without a group of their own use the `generic` rules:
+
+```toml
+[[processors.classify]]
+  selector_tag = "appname"
+  selector_mapping = [
+    { "^postgres" = "postgres" },
+    { ".*"        = "*"        },
+  ]
+  default_regex_group = "generic"
+  match_field = "message"
+  default_category = "info"
+  result_tag = "level"
+
+  [processors.classify.mapped_selector_regexes]
+    postgres = [
+      { error = ["^(ERROR|FATAL|PANIC):"] },
+      { warn  = ["^WARNING:"] },
+    ]
+    nginx = [
+      { error = ['\[(emerg|alert|crit|error)\]'] },
+      { warn  = ['\[warn\]'] },
+    ]
+    generic = [
+      { error = ["(?i)\\b(error|fatal|exception)\\b"] },
+      { warn  = ["(?i)\\bwarn(ing)?\\b"] },
+    ]
+```
+
+### Measuring noise before dropping it
+
+Dropping chatty messages saves storage, but it is worth knowing how much is
+dropped and where it comes from. Here known noise is dropped, and the counts
+per host show which sources produce it. The counts go to InfluxDB, while the
+messages themselves go to a log store:
+
+```toml
+[[processors.classify]]
+  selector_tag = "hostname"
+  default_regex_group = "all"
+  match_field = "message"
+  default_category = "kept"
+  drop_categories = ["noise"]
+  result_tag = "classified"
+
+  aggregation_period = "1m"
+  aggregation_measurement = "log_noise"
+  aggregation_total_field = "total"
+  aggregation_selector_tag = "host"
+  aggregation_selector_fields = ["noise", "kept", "total"]
+
+  [processors.classify.mapped_selector_regexes]
+    all = [
+      { noise = """
+          session opened for user
+          session closed for user
+          Started Session \\d+ of user
+          CRON\\[\\d+\\]
+      """ },
+    ]
+
+[[outputs.influxdb_v2]]
+  namepass = ["log_noise"]
+  # ...
+
+[[outputs.loki]]
+  namedrop = ["log_noise"]
+  # ...
+```
+
+Every minute, one metric per host is emitted:
+
+```text
+log_noise,host=web1 noise=412i,kept=38i,total=450i 1700000040000000000
+```
+
+### States for a monitoring system
+
+The category names can be the states another system expects. The
+[GroundWork output][groundwork] reads the service status from the `status`
+tag, so classifying syslog messages into GroundWork statuses turns them into
+service states:
+
+```toml
+[[processors.classify]]
+  selector_tag = "hostname"
+  selector_mapping = [
+    { "^fire\\d{3}$" = "firewall" },
+  ]
+  default_regex_group = "database"
+  match_field = "message"
+  drop_categories = "ignore"
+  result_tag = "status"
+
+  [processors.classify.mapped_selector_regexes]
+    database = [
+      { ignore                       = "DB client connected" },
+      { SERVICE_OK                   = "Database is starting up" },
+      { SERVICE_WARNING              = 'Tablespace \w+ free space is low' },
+      { SERVICE_UNSCHEDULED_CRITICAL = "Database is shutting down" },
+      { SERVICE_UNKNOWN              = ".*" },
+    ]
+    firewall = [
+      { ignore                       = "snort.+Priority: 3" },
+      { SERVICE_WARNING              = "snort.+Priority: 2" },
+      { SERVICE_UNSCHEDULED_CRITICAL = "snort.+Priority: 1" },
+      { SERVICE_UNKNOWN              = ".*" },
+    ]
+```
+
+The catch-all last category makes sure every message that is not dropped gets
+a valid state. A category name the receiving system does not accept is
+ignored there, so keep the names in line with what it expects.
+
+[groundwork]: ../../outputs/groundwork/README.md
