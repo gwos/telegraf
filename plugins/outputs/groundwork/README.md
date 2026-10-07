@@ -49,7 +49,8 @@ to use them.
   ## Default display name for the host with services(metrics).
   # default_host = "telegraf"
 
-  ## Default service state.
+  ## Service state used when the status is neither given by map_status or a
+  ## "status" tag or field, nor computed from thresholds.
   # default_service_state = "SERVICE_OK"
 
   ## The name of the tag that contains the hostname.
@@ -120,19 +121,21 @@ Each value is taken from the first source that provides it:
 | Host group | `map_hostgroup`, `group_tag`; none means no group |
 | Host alias | `map_hostalias`, `alias_tag`; none means no alias |
 | Service | `map_service` (no match drops the metric), `service_tag`, metric name |
-| Status | `map_status`, `status` tag, `status` field, computed from thresholds |
+| Status | `map_status`, `status` tag, `status` field, computed from thresholds, `default_service_state` |
 | Message | `map_message`, `message` tag, `message` field |
 | Critical threshold of field `F` | `F_cr` tag, `critical` tag, `F_cr` field |
 | Warning threshold of field `F` | `F_wn` tag, `warning` tag, `F_wn` field |
 
 A status that is not one of the supported statuses is skipped, so the next
-source is tried. When no source gives a status, it is computed from the
-performance values: a value with both thresholds set is critical when it is
-at or above the critical threshold, and warning when it is at or above the
-warning threshold. When the warning threshold is above the critical one, the
-comparison is reversed, so lower values are worse. The worst status of all
-values wins, values without both thresholds count as `SERVICE_OK`, and a
-metric without any performance values gets `SERVICE_UNKNOWN`.
+source is tried. When no source gives a status and at least one performance
+value has a threshold, the status is computed from the values: a value with
+both thresholds set is critical when it is at or above the critical
+threshold, and warning when it is at or above the warning threshold. When the
+warning threshold is above the critical one, the comparison is reversed, so
+lower values are worse. The worst status of all values wins, and values
+without both thresholds count as `SERVICE_OK`. A metric without any
+thresholds, including one without performance values, gets
+`default_service_state`.
 
 For example, this metric becomes the `disk` service of host `db1`, with status
 `SERVICE_WARNING` since 85 is between the thresholds, and with the `path`
